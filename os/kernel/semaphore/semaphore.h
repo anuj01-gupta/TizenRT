@@ -65,6 +65,7 @@
 #include <semaphore.h>
 #include <sched.h>
 #include <queue.h>
+#include <tinyara/spinlock.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -97,6 +98,10 @@ void sem_initialize(void);
 #define sem_initialize()
 #endif
 
+#ifdef CONFIG_SMP
+extern spinlock_t g_sem_smp_lock;
+#endif
+
 void sem_waitirq(FAR struct tcb_s *wtcb, int errcode);
 
 /* Recover semaphore resources with a task or thread is destroyed  */
@@ -107,6 +112,8 @@ void sem_recover(FAR struct tcb_s *tcb);
  * holders of semaphores.
  */
 
+struct tcb_s *sem_unblock_task_locked(sem_t *sem, struct tcb_s *htcb);
+void sem_unblock_task_finish(sem_t *sem, struct tcb_s *htcb, struct tcb_s *stcb);
 void sem_unblock_task(sem_t *sem, struct tcb_s *htcb);
 #ifdef SAVE_SEM_HOLDER
 void sem_freeholder(sem_t *sem, FAR struct semholder_s *pholder);

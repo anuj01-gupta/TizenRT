@@ -59,6 +59,7 @@
 #include <sched.h>
 #include <errno.h>
 #include <tinyara/arch.h>
+#include <tinyara/spinlock.h>
 
 #include "semaphore/semaphore.h"
 
@@ -141,6 +142,17 @@ void sem_waitirq(FAR struct tcb_s *wtcb, int errcode)
 
 		sem_canceled(wtcb, sem);
 
+#ifdef CONFIG_SMP
+		{
+			irqstate_t spin_flags;
+			if ((sem->flags & FLAGS_SIGSEM) == 0) {
+				/* Non-signaling sem: acquire spinlock to prevent SMP race
+				 * with sem_post() on other CPU.
+				 */
+				spin_flags = spin_lock_irqsave(&g_sem_smp_lock);
+			}
+#endif
+
 		/* And increment the count on the semaphore.  This releases the count
 		 * that was taken by sem_post().  This count decremented the semaphore
 		 * count to negative and caused the thread to be blocked in the first
@@ -148,6 +160,13 @@ void sem_waitirq(FAR struct tcb_s *wtcb, int errcode)
 		 */
 
 		sem->semcount++;
+
+#ifdef CONFIG_SMP
+			if ((sem->flags & FLAGS_SIGSEM) == 0) {
+				spin_unlock_irqrestore(&g_sem_smp_lock, spin_flags);
+			}
+		}
+#endif
 
 		if ((sem->flags & FLAGS_SEM_MUTEX) != 0) {
 			DEBUGASSERT(sem->semcount < 2);

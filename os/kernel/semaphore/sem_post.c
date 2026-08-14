@@ -63,6 +63,7 @@
 #include <tinyara/arch.h>
 #include <tinyara/sched.h>
 #include <tinyara/mm/mm.h>
+#include <tinyara/spinlock.h>
 
 #include "sched/sched.h"
 #include "semaphore/semaphore.h"
@@ -83,6 +84,15 @@
  * Global Variables
  ****************************************************************************/
 
+#ifdef CONFIG_SMP
+spinlock_t g_sem_smp_lock = SP_UNLOCKED;
+#endif
+
+/* Test variable: when set to 1, sem_post() skips the waiter
+ * scan and forces stcb=NULL. With semcount <= 0, this hits the
+ * DEBUGASSERT at sem_holder.c:926. */
+volatile int g_test_force_null_stcb = 0;
+
 /****************************************************************************
  * Private Variables
  ****************************************************************************/
@@ -94,12 +104,11 @@
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
-void sem_unblock_task(sem_t *sem, struct tcb_s *htcb)
+
+/* Phase 1: Inside spinlock. Scans waiter, changes task_state. No sched_unlock. */
+struct tcb_s *sem_unblock_task_locked(sem_t *sem, struct tcb_s *htcb)
 {
 	struct tcb_s *stcb = NULL;
-#ifdef SAVE_SEM_HOLDER
-	struct semholder_s *pholder = NULL;
-#endif
 
 #ifdef CONFIG_SEMAPHORE_HISTORY
 	save_semaphore_history(sem, (void *)this_task(), SEM_RELEASE);
@@ -144,7 +153,15 @@ void sem_unblock_task(sem_t *sem, struct tcb_s *htcb)
 		}
 	}
 
+	return stcb;
+}
+
+/* Phase 2: Outside spinlock. Priority restore and sched_unlock. Safe to switch. */
+void sem_unblock_task_finish(sem_t *sem, struct tcb_s *htcb, struct tcb_s *stcb)
+{
 #ifdef SAVE_SEM_HOLDER
+	struct semholder_s *pholder = NULL;
+
 	/* Check if we need to drop the priority of any threads holding
 	 * this semaphore.  The priority could have been boosted while they
 	 * held the semaphore.
@@ -165,8 +182,15 @@ void sem_unblock_task(sem_t *sem, struct tcb_s *htcb)
 
 	sched_unlock();
 #endif
-#endif
+#endif /* SAVE_SEM_HOLDER */
+}
 
+/* Wrapper: both phases sequentially. For non-spinlock callers. */
+void sem_unblock_task(sem_t *sem, struct tcb_s *htcb)
+{
+	struct tcb_s *stcb = sem_unblock_task_locked(sem, htcb);
+
+	sem_unblock_task_finish(sem, htcb, stcb);
 }
 
 /****************************************************************************
@@ -222,7 +246,45 @@ int sem_post(FAR sem_t *sem)
 			ASSERT_INFO(sem->semcount < 2, "sem = 0x%x, semcount = %d, flags = 0x%x, caller address = 0x%x\n", sem, sem->semcount, sem->flags, caller_retaddr);
 		}
 
-		sem_unblock_task(sem, htcb);
+#ifdef CONFIG_SMP
+		{
+			irqstate_t spin_flags;
+			if ((sem->flags & FLAGS_SIGSEM) == 0) {
+				/* Prevent SMP race with sem_waitirq() timeout on other CPU. */
+				spin_flags = spin_lock_irqsave(&g_sem_smp_lock);
+			}
+
+#endif
+
+#ifdef CONFIG_TC_SEM_IRQ_RACE
+			if (g_test_force_null_stcb) {
+				/* Force stcb=NULL to simulate SMP race: waiter was removed
+				 * from g_waitingforsemaphore by another CPU's timeout before
+				 * we could scan the list. With semcount <= 0 and stcb == NULL,
+				 * the assert at sem_holder.c:926 will fire. */
+				lldbg("FORCE_NULL: semcount=%d, skipping scan → stcb=NULL → ASSERT!\n",
+				      sem->semcount);
+				sem_restorebaseprio(NULL, htcb, sem);
+			} else
+#endif
+			{
+				/* Phase 1: inside spinlock. Changes task_state, fixes SMP race. */
+				struct tcb_s *stcb = sem_unblock_task_locked(sem, htcb);
+
+#ifdef CONFIG_SMP
+				if ((sem->flags & FLAGS_SIGSEM) == 0) {
+					spin_unlock_irqrestore(&g_sem_smp_lock, spin_flags);
+				}
+#endif
+
+				/* Phase 2: outside spinlock. Priority restore and sched_unlock. */
+				sem_unblock_task_finish(sem, htcb, stcb);
+			}
+
+#ifdef CONFIG_SMP
+		}
+#endif
+
 		ret = OK;
 
 		/* Interrupts may now be enabled. */
