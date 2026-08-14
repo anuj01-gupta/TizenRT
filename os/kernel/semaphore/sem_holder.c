@@ -1025,6 +1025,12 @@ void sem_release_all(FAR struct tcb_s *htcb)
 				up_unblock_task(stcb);
 			}
 		}
+#ifdef CONFIG_PRIORITY_INHERITANCE
+		/* Recompute priorities of remaining holders after returning counts */
+		if ((sem->flags & PRIOINHERIT_FLAGS_DISABLE) == 0) {
+			(void)sem_foreachholder(sem, sem_restoreholderprio, stcb);
+		}
+#endif
 	}
 }
 #endif
