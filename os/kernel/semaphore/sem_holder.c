@@ -991,39 +991,33 @@ void sem_release_all(FAR struct tcb_s *htcb)
 
 	while ((pholder = htcb->holdsem) != NULL) {
 		FAR sem_t *sem = pholder->sem;
+		int counts = pholder->counts;
+		stcb = NULL;
 
 		sem_freeholder(sem, pholder);
 
-		/* Increment the count on the semaphore to release the count that
-		 * was taken by sem_wait() or sem_post().
-		 */
+		/* Release counts one at a time, waking a waiter per count. */
 
-		sem->semcount++;
+		while (counts > 0) {
+			if (sem->semcount < 0) {
+				for (stcb = (FAR struct tcb_s *)g_waitingforsemaphore.head; stcb && stcb->waitsem != sem; stcb = stcb->flink) ;
 
-		/* The terminated holder will never post the semaphore. If tasks
-		 * are already blocked waiting for it, wake up the highest priority
-		 * waiter so that the released count is actually consumed, just as
-		 * sem_post() would do.
-		 */
-
-		if (sem->semcount <= 0) {
-			for (stcb = (FAR struct tcb_s *)g_waitingforsemaphore.head; (stcb && stcb->waitsem != sem); stcb = stcb->flink) ;
-
-			if (stcb) {
-				sem_addholder_tcb(stcb, sem);
-
-				/* Let the task take the semaphore */
-
-				stcb->waitsem = NULL;
+				if (stcb) {
+					sem_addholder_tcb(stcb, sem);
+					stcb->waitsem = NULL;
 
 #ifdef CONFIG_SEMAPHORE_HISTORY
 				save_semaphore_history(sem, (void *)stcb, SEM_ACQUIRE);
 #endif
 
-				/* Restart the waiting task. */
-
-				up_unblock_task(stcb);
+					up_unblock_task(stcb);
+					sem->semcount++;
+					counts--;
+					continue;
+				}
 			}
+			sem->semcount++;
+			counts--;
 		}
 	}
 }
