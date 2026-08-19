@@ -125,6 +125,9 @@ endif
 ifeq ($(CONFIG_TC_KERNEL_SCHED),y)
   CSRCS += tc_sched.c
 endif
+ifeq ($(CONFIG_TC_KERNEL_SEM_SCENARIO),y)
+  CSRCS += stc_sem_common.c stc_sem_inherit.c stc_sem_monitor.c stc_sem_cancel.c stc_sem_recovery.c stc_sem_protocol.c stc_sem_destroy.c stc_sem_smp.c
+endif
 ifeq ($(CONFIG_TC_KERNEL_SIGNAL),y)
   CSRCS += tc_signal.c
 endif

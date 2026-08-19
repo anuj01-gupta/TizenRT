@@ -109,6 +109,8 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 	case TESTIOC_TIMER_INITIALIZE_TEST:
 		ret = test_timer(cmd, arg);
 		break;
+	case TESTIOC_SEM_SNAPSHOT:
+	case TESTIOC_SEM_RESET_TEST:
 	case TESTIOC_SEM_TICK_WAIT_TEST:
 		ret = test_sem(cmd, arg);
 		break;

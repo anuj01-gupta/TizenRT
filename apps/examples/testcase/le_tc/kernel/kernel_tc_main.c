@@ -163,6 +163,16 @@ int tc_kernel_main(int argc, char *argv[])
 	semaphore_main();
 #endif
 
+#ifdef CONFIG_TC_KERNEL_SEM_SCENARIO
+	stc_sem_inherit_main();
+	stc_sem_monitor_main();
+	stc_sem_cancel_main();
+	stc_sem_recovery_main();
+	stc_sem_protocol_main();
+	stc_sem_destroy_main();
+	stc_sem_smp_main();
+#endif
+
 #ifdef CONFIG_TC_KERNEL_SIGNAL
 	signal_main();
 #endif

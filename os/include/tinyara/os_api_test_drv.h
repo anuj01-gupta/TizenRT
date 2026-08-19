@@ -28,6 +28,9 @@
  ****************************************************************************/
 
 #include <tinyara/config.h>
+#include <stdint.h>
+#include <semaphore.h>
+#include <sys/types.h>
 #include <tinyara/fs/ioctl.h>
 
 #ifdef CONFIG_DRIVERS_OS_API_TEST
@@ -88,7 +91,46 @@
 #define TESTIOC_GET_FS_PARTNO			_TESTIOC(24)
 #endif
 
+#define TESTIOC_SEM_SNAPSHOT			_TESTIOC(25)
+#define TESTIOC_SEM_RESET_TEST			_TESTIOC(26)
+
 #define OS_API_TEST_DRVPATH	"/dev/os_api_test"
+
+/****************************************************************************
+ * Public Types
+ ****************************************************************************/
+
+/* Payload for TESTIOC_SEM_SNAPSHOT.
+ *
+ * The semaphore holder list, the per holder counts and each holder's base
+ * priority are kernel structures.  Under CONFIG_APP_BINARY_SEPARATION a user
+ * space test cannot reach them, and CONFIG_SEM_PHDEBUG - which would expose
+ * sem_enumholders() - is not enabled on the reference platform.  This command
+ * copies out a read only snapshot so scenario tests can assert that a holder
+ * record was created, decremented or freed.
+ *
+ * It takes no locks beyond a critical section, allocates nothing and modifies
+ * no kernel state.  Scenario tests must not call it inside a measurement
+ * window, precisely because it takes that critical section.
+ */
+
+#define SEM_SNAPSHOT_MAX_HOLDERS	8
+
+struct sem_holder_info_s {
+	pid_t pid;					/* Holder task id                        */
+	int16_t counts;				/* Counts this holder owns               */
+	uint8_t sched_priority;		/* Effective priority                    */
+	uint8_t base_priority;		/* Priority the restore must return to   */
+};
+
+struct sem_snapshot_s {
+	FAR sem_t *sem;				/* IN  : semaphore to inspect            */
+	int16_t semcount;			/* OUT : current count                   */
+	uint8_t flags;				/* OUT : SIGSEM / SEM_MUTEX / PRIO flags */
+	uint8_t nholders;			/* OUT : holder records found            */
+	uint8_t nwaiters;			/* OUT : tasks blocked on this semaphore */
+	struct sem_holder_info_s holder[SEM_SNAPSHOT_MAX_HOLDERS];
+};
 
 /****************************************************************************
  * Public Data

@@ -161,6 +161,21 @@ config TC_KERNEL_SEMAPHORE
 	bool "Semaphore"
 	default n
 
+config TC_KERNEL_SEM_SCENARIO
+	bool "Semaphore Scenario (stc)"
+	default n
+	depends on PRIORITY_INHERITANCE
+	---help---
+		Scenario based tests for priority inheritance and semaphore
+		recovery.  Unlike the tc_ and itc_ tiers, these assert on
+		behaviour - the effective priority of each task and the
+		semaphore count - rather than on return codes.
+
+		Phase 1 provides the shared harness and Family A, the boost
+		and restore base cases.  The tier is kept out of TC_KN_ALL on
+		purpose: it is intended for a nightly job rather than a
+		per-commit gate.
+
 config TC_KERNEL_SIGNAL
 	bool "Signal"
 	default n
