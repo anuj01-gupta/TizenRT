@@ -33,6 +33,7 @@
 #include <tinyara/arch.h>
 #include <tinyara/wdog.h>
 #include <tinyara/mm/mm.h>
+#include <tinyara/mm/kasan.h>
 
 #include "sched/sched.h"
 #include "wdog/wdog.h"
@@ -62,11 +63,22 @@ void wd_corruption_dbg(struct wdog_s *wdog)
 #ifdef CONFIG_DEBUG_MM_HEAPINFO
 		// Wdog struct is in heap
 		lldbg("WDOG is in HEAP. Print neighbour heap nodes\n");
+
+		/* Reading the node headers around the wdog touches memory KASan
+		 * keeps poisoned, and this file is outside os/mm and so is
+		 * instrumented. Turn checking off across the dump so that a
+		 * diagnostic does not turn into a second, misleading report.
+		 */
+
+		kasan_stop();
+
 		wd_node = (uint32_t)wdog - SIZEOF_MM_ALLOCNODE;
 		lldbg("PREV WDOG INFO\n");
 		mm_dump_node((struct mm_allocnode_s *)(wd_node - (((struct mm_allocnode_s *)wd_node)->preceding & ~MM_ALLOC_BIT)), "PREV HEAP NODE");
 		lldbg("NEXT WDOG INFO\n");
 		mm_dump_node((struct mm_allocnode_s *)(wd_node + ((struct mm_allocnode_s *)wd_node)->size), "NEXT HEAP NODE");
+
+		kasan_start();
 #endif
 
 	} else if (wd_is_prealloc(wdog)) {

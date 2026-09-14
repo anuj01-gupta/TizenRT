@@ -90,6 +90,10 @@
 #include <tinyara/security_level.h>
 #endif
 
+#ifdef CONFIG_MM_KASAN_SELFTEST
+#include <tinyara/mm/kasan.h>
+#endif
+
 /************************************************************************
  * Private Functions
  ************************************************************************/
@@ -364,6 +368,30 @@ int prctl(int option, ...)
 		checker_pid = va_arg(ap, int);
 
 		ret = run_all_mem_leak_checker(checker_pid);
+		va_end(ap);
+
+		return ret;
+	}
+#endif
+#ifdef CONFIG_MM_KASAN_SELFTEST
+	case PR_KASAN_SELFTEST:
+	{
+		int ret;
+		int testcase;
+
+		/* The faulting access has to be made by the kernel, against a block
+		 * from the kernel heap. User space allocates from a heap that is
+		 * never registered with KASan and is not instrumented, so a test
+		 * written in user space would report nothing however broken the
+		 * memory manager was.
+		 *
+		 * Every case but KASAN_SELFTEST_INBOUNDS is expected to assert, so
+		 * this usually does not return.
+		 */
+
+		testcase = va_arg(ap, int);
+
+		ret = kasan_selftest(testcase);
 		va_end(ap);
 
 		return ret;

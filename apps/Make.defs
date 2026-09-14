@@ -53,6 +53,25 @@
 
 include $(TOPDIR)/.config
 
+# KASan instruments the kernel only.
+#
+# Everything built under apps/ is archived into libapps and linked into the
+# user and common binaries. Those link lines carry no KASan runtime: it lives
+# in libkmm, which only the kernel image links. An instrumented object here is
+# therefore an unresolvable reference rather than a slow one, and the failure
+# lands at the end of a full build.
+#
+# os/LibTargets.mk does pass KERNEL=n when it builds libapps, which is what
+# the board Make.defs tests before adding -fsanitize=kernel-address. This does
+# not rely on that reaching every sub-make below it. The test there is an opt
+# out, so a pass which loses the variable is instrumented rather than skipped,
+# and this file is included by every Makefile under apps/.
+
+ifeq ($(CONFIG_MM_KASAN),y)
+CFLAGS += -fno-sanitize=kernel-address
+CXXFLAGS += -fno-sanitize=kernel-address
+endif
+
 # Builtin Registration
 
 BUILTIN_REGISTRY = $(APPDIR)$(DELIM)builtin$(DELIM)registry

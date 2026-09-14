@@ -64,6 +64,7 @@
 #endif
 #endif
 #include <tinyara/mm/mm.h>
+#include <tinyara/mm/kasan.h>
 
 #ifdef CONFIG_DEBUG_MM_HEAPINFO
 #include  <tinyara/sched.h>
@@ -111,6 +112,7 @@ FAR void *mm_memalign(FAR struct mm_heap_s *heap, size_t alignment, size_t size,
 {
 	FAR struct mm_freenode_s *node = NULL;
 	void *ret = NULL;
+	size_t nodesize = 0;
 	int ndx;
 	size_t newsize;
 	FAR struct mm_allocnode_s *alignchunk = NULL;
@@ -273,9 +275,20 @@ retry_after_gc:
 #endif
 
 		ret = (void *)alignchunk;
+		nodesize = node->size;
 	}
 
 	mm_givesemaphore(heap);
+
+	if (ret) {
+		/* Only the aligned chunk that is handed out is opened up. The
+		 * remainders split off in front of and behind it went back to the
+		 * free list and were never unpoisoned, since a region starts out
+		 * wholly poisoned and only live allocations are cleared.
+		 */
+
+		ret = kasan_unpoison(ret, nodesize - SIZEOF_MM_ALLOCNODE);
+	}
 
 	if (!ret && gc_done == false) {
 		mdbg("Allocation failed!!! We dont have enough memory. Try to free dead task stack areas\n");

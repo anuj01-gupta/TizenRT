@@ -1,0 +1,86 @@
+###########################################################################
+#
+# Copyright 2026 Samsung Electronics All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+# either express or implied. See the License for the specific
+# language governing permissions and limitations under the License.
+#
+###########################################################################
+############################################################################
+# os/mm/kasan/Make.defs
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.  The
+# ASF licenses this file to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance with the
+# License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+# License for the specific language governing permissions and limitations
+# under the License.
+#
+# Derived from Apache NuttX mm/kasan/Make.defs at commit b4aa94d.
+#
+############################################################################
+
+ifeq ($(CONFIG_MM_KASAN),y)
+
+# Only hook.c is listed. generic.c is included by it rather than compiled
+# separately, so that the poison test inlines into the instrumentation entry
+# points.
+#
+# It is built only for the passes that are actually instrumented, which is the
+# same test the board Make.defs applies to the compiler flags: the kernel and
+# the flat build, not the user libraries. Carrying the runtime into libumm
+# would add several kilobytes to the user image for entry points nothing
+# calls, and would turn a mistaken instrumentation of user space into dead
+# code rather than the link error it should be.
+
+ifneq ($(KERNEL),n)
+CSRCS += hook.c
+endif
+
+# NOTE: os/mm/Makefile includes every Make.defs into one make invocation and
+# compiles the whole directory with a single $(CFLAGS). These three flags
+# therefore apply to all of os/mm, not just to kasan/. That is intentional
+# and matches upstream:
+#
+#  -fno-sanitize=kernel-address
+#      The sanitizer must not instrument itself, or the first shadow lookup
+#      recurses forever. Excluding the rest of the memory manager along with
+#      it is also what makes the allocator safe to instrument at all: the
+#      free path writes its delay list link into a block it has just
+#      poisoned, and the heap walkers read every free node by design.
+#
+#  -fno-builtin
+#      Keeps the compiler from turning a poisoned-memory access into an
+#      inlined memcpy or memset that would bypass instrumentation.
+#
+#  -fno-lto
+#      The instrumentation entry points are referenced only by compiler
+#      generated calls, so LTO may consider them unused.
+
+CFLAGS += -fno-sanitize=kernel-address
+CFLAGS += -fno-builtin
+CFLAGS += -fno-lto
+
+DEPPATH += --dep-path kasan
+VPATH += :kasan
+
+endif

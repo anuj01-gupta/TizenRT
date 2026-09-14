@@ -63,6 +63,7 @@
 
 #include <tinyara/sched.h>
 #include <tinyara/mm/mm.h>
+#include <tinyara/mm/kasan.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -138,6 +139,39 @@ int mm_addregion(FAR struct mm_heap_s *heap, FAR void *heapstart, size_t heapsiz
 		return -EINVAL;
 	}
 	heapsize = heapend - heapbase;
+
+#if defined(CONFIG_BUILD_FLAT) || defined(__KERNEL__)
+	/* Hand the region to KASan before the heap is laid out over it, but only
+	 * if this is the kernel heap.
+	 *
+	 * The build guard alone is not enough to decide that. It says which copy
+	 * of the memory manager is running, not which heap is being built: in a
+	 * protected build os/mm is compiled into libkmm with __KERNEL__ defined
+	 * and into libumm without it, but binfmt runs in the kernel and calls
+	 * mm_initialize() from there to build the user heap of every app it
+	 * loads. Registering those would carve a shadow out of the app's heap
+	 * and poison memory that libumm, where the app's own allocations are
+	 * served, never unpoisons. Kernel code touching that memory legitimately
+	 * would then be reported.
+	 *
+	 * kasan_register() carves its shadow out of the tail of the region and
+	 * reduces heapsize by that much, so heapend has to be recomputed from
+	 * the reduced size. Registering after the guard nodes were placed would
+	 * put the heap and its own shadow on top of each other.
+	 */
+
+	if (heap >= g_kmmheap && heap < &g_kmmheap[CONFIG_KMM_NHEAPS]) {
+		kasan_register((FAR void *)heapbase, &heapsize);
+
+		heapend = MM_ALIGN_DOWN(heapbase + heapsize);
+		heapsize = heapend - heapbase;
+
+		if (heapbase >= (uintptr_t)heapend) {
+			mdbg("ERROR : region too small once the KASan shadow is carved out.\n");
+			return -EINVAL;
+		}
+	}
+#endif
 
 	mlldbg("Region %d: base=%p size=%u\n", IDX + 1, heapstart, heapsize);
 

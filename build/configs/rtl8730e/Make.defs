@@ -136,6 +136,49 @@ ifeq ($(CONFIG_FRAME_POINTER),y)
   ARCHOPTIMIZATION += -fomit-frame-pointer -mapcs -mno-sched-prolog
 endif
 
+# KASan instrumentation.
+#
+# Only the kernel is instrumented. The shadow map is registered for the
+# kernel heap alone, so instrumenting user space would emit a call for every
+# memory access that then returns immediately, having found no region to
+# check: cost without cover. os/mm is excluded separately, by its own
+# Make.defs, because the sanitizer must not instrument itself.
+#
+# KERNEL is set on the command line by os/LibTargets.mk: y for the kernel
+# libraries, n for the user ones and for libapps, libexternal and the
+# loadable apps. It is unset for the flat build, where there is one image
+# and one heap, so everything is instrumented there.
+
+ifeq ($(CONFIG_MM_KASAN_INSTRUMENT_ALL),y)
+  KASAN_THIS_PASS = y
+  ifneq ($(CONFIG_BUILD_FLAT),y)
+    ifeq ($(KERNEL),n)
+      KASAN_THIS_PASS =
+    endif
+  endif
+endif
+
+ifeq ($(KASAN_THIS_PASS),y)
+  ARCHOPTIMIZATION += -fsanitize=kernel-address
+
+  # The call threshold at 0 forces outline instrumentation: every access
+  # becomes a helper call, so the runtime resolves the shadow itself. Inline
+  # instrumentation would need the shadow at a link time constant address,
+  # and this port carves it out of the heap at run time.
+  KASAN_PARAM += asan-stack=0
+  KASAN_PARAM += asan-globals=0
+  KASAN_PARAM += asan-instrumentation-with-call-threshold=0
+
+  ifeq ($(CONFIG_MM_KASAN_DISABLE_READS_CHECK),y)
+    KASAN_PARAM += asan-instrument-reads=0
+  endif
+  ifeq ($(CONFIG_MM_KASAN_DISABLE_WRITES_CHECK),y)
+    KASAN_PARAM += asan-instrument-writes=0
+  endif
+
+  ARCHOPTIMIZATION += $(addprefix --param ,$(KASAN_PARAM))
+endif
+
 ARCHCFLAGS += -fno-builtin -fno-common
 ARCHCXXFLAGS = -fno-builtin -fexceptions 
 ifeq ($(QUICKBUILD),y)
