@@ -64,6 +64,8 @@ void mmu_clear_app_pgtbl(uint32_t app_id);
  * MMU Page Protection Functions for Use-After-Free Detection
  * ********************************************************************************/
 
+#ifdef CONFIG_MMU_PAGE_PROTECT
+
 /****************************************************************************
  * Name: mmu_split_section_to_l2
  *
@@ -139,5 +141,7 @@ void mmu_set_page_ro(uint32_t vaddr);
  ****************************************************************************/
 
 void mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte);
+
+#endif /* CONFIG_MMU_PAGE_PROTECT */
 
 #endif

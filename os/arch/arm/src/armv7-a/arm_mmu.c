@@ -52,12 +52,205 @@
 #include <tinyara/mm/mm.h>
 #endif
 
+#ifdef CONFIG_MMU_PAGE_PROTECT
+#ifdef CONFIG_SMP
+#include "gic.h"
+#include "smp.h"
+#include "sched/sched.h"
+#endif
+#endif
+
 /****************************************************************************
  * Private Data
  ****************************************************************************/
 #ifdef CONFIG_APP_BINARY_SEPARATION
 static int l2_idx = 0;
 #endif
+
+#ifdef CONFIG_MMU_PAGE_PROTECT
+#ifdef CONFIG_SMP
+
+/* Global variable to pass PTE address to SGI4 handler on other cores.
+ * Written by Core 0 before sending SGI4, read by Core 1 in SGI handler.
+ * The PTE address is needed for DCIMVAC (invalidate dcache line) to
+ * remove the stale PTE from Core 1's L1 data cache before TLBIALL.
+ */
+static volatile uint32_t g_tlb_flush_pte_addr;
+static volatile uint32_t g_tlb_flush_done;  /* ACK flag: Core 1 sets after TLB flush */
+
+/* Safe wrapper: cross-checks mmu_l1_pgtable() against TTBR0.
+ * If they match, returns mmu_l1_pgtable() (no change).
+ * If they differ, prints warning and returns TTBR0-based address.
+ */
+static inline uint32_t *mmu_l1_pgtable_safe(void)
+{
+	uint32_t *pgtable = mmu_l1_pgtable();
+	uint32_t raw_ttbr0;
+
+	__asm__ volatile("mrc p15, 0, %0, c2, c0, 0" : "=r"(raw_ttbr0));
+	uint32_t ttbr0_base = raw_ttbr0 & 0xFFFFC000;
+
+	if ((uint32_t)pgtable != ttbr0_base) {
+		lldbg("WARN: mmu_l1_pgtable()=0x%08x but TTBR0 base=0x%08x — using TTBR0\n",
+		      (uint32_t)pgtable, ttbr0_base);
+		return (uint32_t *)ttbr0_base;
+	}
+	return pgtable;
+}
+
+/* SGI4 handler — runs on target CPU, flushes entire local TLB.
+ * Uses TLBIALL (not TLBIMVA) to:
+ *   1. Avoid needing to pass address via shared variable (no cache coherency issue)
+ *   2. Flush stale 1MB section TLB entries after section-to-L2 split
+ *
+ * CRITICAL: Also does DCIMVAC to invalidate the stale PTE from this CPU's
+ * L1 data cache. Without this, the MMU page table walker reads the old
+ * PTE from the data cache after TLBIALL, and the protection has no effect.
+ *
+ * This is non-blocking: the requesting CPU sends SGI4 and returns immediately.
+ * The target CPU flushes its TLB asynchronously when the SGI is handled.
+ */
+int mmu_tlb_flush_sgi_handler(int irq, void *context, void *arg)
+{
+	uint32_t pte_addr = g_tlb_flush_pte_addr;
+	uint32_t pte_before;
+	uint32_t sctlr, ttbr0, dacr;
+
+	/* Read system control registers to verify MMU state */
+	__asm__ volatile("mrc p15, 0, %0, c1, c0, 0" : "=r"(sctlr));  /* SCTLR */
+	__asm__ volatile("mrc p15, 0, %0, c2, c0, 0" : "=r"(ttbr0));  /* TTBR0 */
+	__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr));   /* DACR */
+
+	pte_before = *(volatile uint32_t *)pte_addr;
+
+	lldbg("SGI4: === ENTER on CPU%d ===\n", this_cpu());
+	lldbg("SGI4: SCTLR=0x%08x (MMU=%d DC=%d IC=%d)\n",
+	      sctlr, sctlr & 1, (sctlr >> 2) & 1, (sctlr >> 12) & 1);
+	lldbg("SGI4: TTBR0=0x%08x (base=0x%08x)\n", ttbr0, ttbr0 & 0xFFFFC000);
+	lldbg("SGI4: DACR=0x%08x (dom0=%s dom1=%s)\n",
+	      dacr,
+	      (dacr & 0x3) == 0 ? "NO_ACCESS" :
+	      (dacr & 0x3) == 1 ? "CLIENT" :
+	      (dacr & 0x3) == 3 ? "MANAGER" : "RESERVED",
+	      ((dacr >> 2) & 0x3) == 0 ? "NO_ACCESS" :
+	      ((dacr >> 2) & 0x3) == 1 ? "CLIENT" :
+	      ((dacr >> 2) & 0x3) == 3 ? "MANAGER" : "RESERVED");
+	lldbg("SGI4: pte_addr=0x%08x pte_before=0x%08x (AP=0x%x type=0x%x)\n",
+	      pte_addr, pte_before, (pte_before >> 4) & 3, pte_before & 3);
+
+	/* CRITICAL CHECK: If domain 0 is MANAGER, AP bits are IGNORED! */
+	if ((dacr & 0x3) == 3) {
+		lldbg("SGI4: !!! DOMAIN 0 IS MANAGER — AP BITS IGNORED! THIS IS THE BUG !!!\n");
+	}
+
+	/* Invalidate dcache line for pte_addr — removes stale PTE from this CPU's L1 dcache */
+	cp15_invalidate_dcacheline_bymva(pte_addr);
+	ARM_DSB();
+
+	/* Flush TLB — TLBIALL (entire local TLB) */
+	__asm__ volatile("mcr p15, 0, r0, c8, c7, 0");  /* TLBIALL */
+	ARM_DSB();
+	ARM_ISB();
+
+	lldbg("SGI4: TLBIALL done, signaling completion\n");
+
+	/* ACK: set g_tlb_flush_done so Core 0 can stop spin-waiting */
+	g_tlb_flush_done = 1;
+	cp15_clean_dcache_bymva((uint32_t)&g_tlb_flush_done);
+	ARM_DSB();
+
+	return OK;
+}
+#endif /* CONFIG_SMP */
+
+/* SMP TLB invalidate by VA.
+ * On SMP systems, TLBIMVAAIS (hardware broadcast) may not work if the
+ * SMP coherency bit is not enabled. Instead, we use SGI (Software
+ * Generated Interrupt) to notify other cores to flush their local TLB.
+ * This is guaranteed to work because GIC SGI is already used for
+ * CPU start/pause/hotplug on this hardware.
+ *
+ * Non-blocking: sends SGI4 to all other cores and returns immediately.
+ */
+static inline void mmu_invalidate_tlb_bymva_is(uint32_t vaddr)
+{
+#ifdef CONFIG_SMP
+	int cpu;
+	int me = this_cpu();
+	uint32_t l1_entry;
+
+	/* 1. Compute PTE address using mmu_l1_pgtable_safe() */
+	{
+		uint32_t *l1table = mmu_l1_pgtable_safe();
+		uint32_t l1_index = vaddr >> 20;
+		l1_entry = l1table[l1_index];
+	}
+
+	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_PTE) {
+		uint32_t *l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
+		uint32_t l2_index = (vaddr & 0x000FF000) >> 12;
+		g_tlb_flush_pte_addr = (uint32_t)&l2table[l2_index];
+	} else {
+		uint32_t *l1table = mmu_l1_pgtable_safe();
+		g_tlb_flush_pte_addr = (uint32_t)&l1table[vaddr >> 20];
+	}
+
+	/* 2. Clean dcache for g_tlb_flush_pte_addr so Core 1 sees the correct value */
+	cp15_clean_dcache_bymva((uint32_t)&g_tlb_flush_pte_addr);
+	ARM_DSB();
+
+	/* 3. Clear completion flag */
+	g_tlb_flush_done = 0;
+	cp15_clean_dcache_bymva((uint32_t)&g_tlb_flush_done);
+	ARM_DSB();
+
+	/* 4. Flush local TLB for this address (TLBIMVA — local only) */
+	__asm__ volatile("mcr p15, 0, %0, c8, c7, 1" :: "r"(vaddr)); /* TLBIMVA — local */
+	ARM_DSB();
+	ARM_ISB();
+
+	lldbg("TLB_IS: CPU%d local TLB flushed for vaddr=0x%08x, sending SGI4\n", me, vaddr);
+
+	/* 5. Send SGI4 to all other cores */
+	for (cpu = 0; cpu < CONFIG_SMP_NCPUS; cpu++) {
+		if (cpu == me) {
+			continue;
+		}
+		{
+			uint32_t pte_val = *(volatile uint32_t *)g_tlb_flush_pte_addr;
+			lldbg("TLB_IS: CPU%d sending SGI4 to CPU%d (vaddr=0x%08x pte_addr=0x%08x pte_val=0x%08x AP=0x%x type=0x%x)\n",
+			       me, cpu, vaddr, g_tlb_flush_pte_addr, pte_val,
+			       (pte_val >> 4) & 3, pte_val & 3);
+		}
+		arm_cpu_sgi(GIC_IRQ_SGI4, (1 << cpu));
+
+		/* 6. Spin-wait for this core to acknowledge TLB flush */
+		{
+			uint32_t timeout = 1000000;
+			while (g_tlb_flush_done == 0 && timeout-- > 0) {
+				/* Invalidate dcache line to force re-read from memory */
+				cp15_invalidate_dcacheline_bymva((uint32_t)&g_tlb_flush_done);
+			}
+			if (g_tlb_flush_done) {
+				lldbg("TLB_IS: CPU%d acknowledged TLB flush\n", cpu);
+			} else {
+				lldbg("TLB_IS: TIMEOUT waiting for CPU%d!\n", cpu);
+			}
+		}
+		/* Reset flag for next CPU (if multiple) */
+		g_tlb_flush_done = 0;
+		cp15_clean_dcache_bymva((uint32_t)&g_tlb_flush_done);
+		ARM_DSB();
+	}
+#else
+	/* Non-SMP: just flush local TLB */
+	__asm__ volatile("mcr p15, 0, %0, c8, c7, 1" :: "r"(vaddr)); /* TLBIMVA — local */
+	ARM_DSB();
+	ARM_ISB();
+#endif
+}
+#endif /* CONFIG_MMU_PAGE_PROTECT */
+
 
 /****************************************************************************
  * Private Functions
@@ -594,7 +787,7 @@ void mmu_split_section_to_l2(uint32_t vaddr)
 		return;
 	}
 
-	l1table = mmu_l1_pgtable();
+	l1table = mmu_l1_pgtable_safe();
 	l1_index = section_addr >> 20;
 
 	/* Extract the physical base address from the section entry */
@@ -723,6 +916,35 @@ void mmu_split_section_to_l2(uint32_t vaddr)
 	cp15_clean_dcache_bymva((uint32_t)&l1table[l1_index]);
 	ARM_DSB();
 
+	/* Also split in kernel L1 table so Core 1 (kernel thread) sees the L2 table.
+	 * Core 0 uses App1's L1 table (TTBR0=0x63ff4000), but Core 1 uses the
+	 * kernel L1 table (TTBR0=0x63ff0000). If we only split in App1's table,
+	 * Core 1 still sees the 1MB section with RW and bypasses the protection.
+	 *
+	 * Fix: replace the kernel L1 section with an L1 PTE pointing to the
+	 * SAME s_l2_table. Then both cores walk the same L2 table and see
+	 * the same AP bits.
+	 */
+	{
+		uint32_t *kern_l1 = (uint32_t *)PGTABLE_BASE_VADDR;
+		uint32_t kern_entry = kern_l1[l1_index];
+
+		if ((kern_entry & PMD_TYPE_MASK) == PMD_TYPE_SECT) {
+			uint32_t new_kern_l1;
+
+			new_kern_l1 = (uint32_t)l2table & PMD_PTE_PADDR_MASK;
+			new_kern_l1 |= PMD_TYPE_PTE;
+			new_kern_l1 |= (kern_entry & PMD_SECT_DOM_MASK);  /* preserve domain */
+
+			kern_l1[l1_index] = new_kern_l1;
+			cp15_clean_dcache_bymva((uint32_t)&kern_l1[l1_index]);
+			ARM_DSB();
+
+			lldbg("SPLIT: kernel L1[0x%x] = 0x%08x (was section 0x%08x)\n",
+			      l1_index, new_kern_l1, kern_entry);
+		}
+	}
+
 	/* Invalidate the entire TLB (not just by VA) to ensure no stale
 	 * section-mapping TLB entries remain.  The old L1 section entry
 	 * may have been cached in the TLB as a 1MB section mapping; after
@@ -769,7 +991,7 @@ uint32_t mmu_save_page_pte(uint32_t vaddr)
 
 	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_SECT) {
 		/* 1MB section - permission is in the L1 entry directly */
-		uint32_t *l1table = mmu_l1_pgtable();
+		uint32_t *l1table = mmu_l1_pgtable_safe();
 		uint32_t index = page_addr >> 20;
 		return l1table[index];
 	}
@@ -816,7 +1038,7 @@ void mmu_set_page_no_access(uint32_t vaddr)
 
 	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_SECT) {
 		/* 1MB section - modify the L1 entry directly */
-		uint32_t *l1table = mmu_l1_pgtable();
+		uint32_t *l1table = mmu_l1_pgtable_safe();
 		uint32_t index = page_addr >> 20;
 
 		/* Clear ALL AP bits to 00 = No access at any privilege level.
@@ -836,6 +1058,21 @@ void mmu_set_page_no_access(uint32_t vaddr)
 		/* L1 points to an L2 page table */
 		uint32_t *l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
 		uint32_t l2_index = (page_addr & 0x000FF000) >> 12;
+		uint32_t dacr;
+
+		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr));
+		lldbg("SET_NO_ACCESS: CPU%d DACR=0x%08x (dom0=%s) l1_entry=0x%08x (dom=%d)\n",
+		      this_cpu(), dacr,
+		      (dacr & 0x3) == 0 ? "NO_ACCESS" :
+		      (dacr & 0x3) == 1 ? "CLIENT" :
+		      (dacr & 0x3) == 3 ? "MANAGER" : "RESERVED",
+		      l1_entry, (l1_entry >> 5) & 0xF);
+		lldbg("SET_NO_ACCESS: vaddr=0x%08x l2table=0x%08x l2_index=%d pte_addr=0x%08x\n",
+		      page_addr, (uint32_t)l2table, l2_index, (uint32_t)&l2table[l2_index]);
+		lldbg("SET_NO_ACCESS: PTE before=0x%08x (AP=0x%x AP2=%d type=0x%x)\n",
+		      l2table[l2_index], (l2table[l2_index] >> 4) & 3,
+		      (l2table[l2_index] >> 9) & 1, l2table[l2_index] & 3);
+
 
 		/* Set AP=00 (No Access at any privilege level).
 		 * Must clear both AP[1:0] (bits 4-5, PTE_AP_MASK) and
@@ -844,9 +1081,15 @@ void mmu_set_page_no_access(uint32_t vaddr)
 		 * read accesses would NOT fault. */
 		l2table[l2_index] = (l2table[l2_index] & ~PTE_AP_MASK & ~PTE_AP2) | PTE_AP_NONE;
 
+		lldbg("SET_NO_ACCESS: PTE after write=0x%08x (AP=0x%x type=0x%x)\n",
+		      l2table[l2_index], (l2table[l2_index] >> 4) & 3, l2table[l2_index] & 3);
 
 		cp15_clean_dcache_bymva((uint32_t)&l2table[l2_index]);
-		cp15_invalidate_tlb_bymva(page_addr);
+
+		lldbg("SET_NO_ACCESS: PTE after clean=0x%08x (AP=0x%x type=0x%x)\n",
+		      l2table[l2_index], (l2table[l2_index] >> 4) & 3, l2table[l2_index] & 3);
+
+		mmu_invalidate_tlb_bymva_is(page_addr);
 	}
 }
 #endif
@@ -883,7 +1126,7 @@ void mmu_set_page_ro(uint32_t vaddr)
 
 	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_SECT) {
 		/* 1MB section - modify the L1 entry directly */
-		uint32_t *l1table = mmu_l1_pgtable();
+		uint32_t *l1table = mmu_l1_pgtable_safe();
 		uint32_t index = page_addr >> 20;
 
 		/* Set AP to privileged read-only */
@@ -898,6 +1141,21 @@ void mmu_set_page_ro(uint32_t vaddr)
 		/* L1 points to an L2 page table */
 		uint32_t *l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
 		uint32_t l2_index = (page_addr & 0x000FF000) >> 12;
+		uint32_t dacr;
+
+		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr));
+		lldbg("SET_RO: CPU%d DACR=0x%08x (dom0=%s) l1_entry=0x%08x (dom=%d)\n",
+		      this_cpu(), dacr,
+		      (dacr & 0x3) == 0 ? "NO_ACCESS" :
+		      (dacr & 0x3) == 1 ? "CLIENT" :
+		      (dacr & 0x3) == 3 ? "MANAGER" : "RESERVED",
+		      l1_entry, (l1_entry >> 5) & 0xF);
+		lldbg("SET_RO: vaddr=0x%08x l2table=0x%08x l2_index=%d pte_addr=0x%08x\n",
+		      page_addr, (uint32_t)l2table, l2_index, (uint32_t)&l2table[l2_index]);
+		lldbg("SET_RO: PTE before=0x%08x (AP=0x%x AP2=%d type=0x%x)\n",
+		      l2table[l2_index], (l2table[l2_index] >> 4) & 3,
+		      (l2table[l2_index] >> 9) & 1, l2table[l2_index] & 3);
+
 
 		/* Set AP to privileged read-only (PTE_AP_R1).
 		 * Must clear both AP[1:0] (bits 4-5, PTE_AP_MASK) and
@@ -905,8 +1163,15 @@ void mmu_set_page_ro(uint32_t vaddr)
 		 * because PTE_AP_R1 = PTE_AP_R12 = PTE_AP0 | PTE_AP2. */
 		l2table[l2_index] = (l2table[l2_index] & ~PTE_AP_MASK & ~PTE_AP2) | PTE_AP_R1;
 
+		lldbg("SET_RO: PTE after write=0x%08x (AP=0x%x type=0x%x)\n",
+		      l2table[l2_index], (l2table[l2_index] >> 4) & 3, l2table[l2_index] & 3);
+
 		cp15_clean_dcache_bymva((uint32_t)&l2table[l2_index]);
-		cp15_invalidate_tlb_bymva(page_addr);
+
+		lldbg("SET_RO: PTE after clean=0x%08x (AP=0x%x type=0x%x)\n",
+		      l2table[l2_index], (l2table[l2_index] >> 4) & 3, l2table[l2_index] & 3);
+
+		mmu_invalidate_tlb_bymva_is(page_addr);
 	}
 }
 #endif
@@ -941,7 +1206,7 @@ void mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte)
 
 	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_SECT) {
 		/* 1MB section - restore the L1 entry directly */
-		uint32_t *l1table = mmu_l1_pgtable();
+		uint32_t *l1table = mmu_l1_pgtable_safe();
 		uint32_t index = page_addr >> 20;
 
 		l1table[index] = saved_pte;
@@ -960,7 +1225,7 @@ void mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte)
 		l2table[l2_index] = saved_pte;
 
 		cp15_clean_dcache_bymva((uint32_t)&l2table[l2_index]);
-		cp15_invalidate_tlb_bymva(page_addr);
+		mmu_invalidate_tlb_bymva_is(page_addr);
 	}
 }
 #endif

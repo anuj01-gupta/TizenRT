@@ -65,7 +65,7 @@
  * The ioctl numbers must match those in os_api_test_drv.h.
  */
 #define OS_API_TEST_DRVPATH        "/dev/os_api_test"
-#define _TESTIOC(nr)               _IOC(_IOC_NONE, 0, nr, 0)
+#define _TESTIOC(nr)               _IOC(_TESTIOCBASE, nr)
 #define TESTIOC_UAF_MMU_PROTECT    _TESTIOC(25)
 #define TESTIOC_UAF_NO_MMU         _TESTIOC(26)
 #define TESTIOC_WDOG_MMU_PROTECT_TEST _TESTIOC(27)
@@ -73,7 +73,7 @@
 
 #ifdef CONFIG_WDOG_MMU_DEFECT_TEST
 #ifndef _TESTIOC
-#define _TESTIOC(nr)               _IOC(_IOC_NONE, 0, nr, 0)
+#define _TESTIOC(nr)               _IOC(_TESTIOCBASE, nr)
 #endif
 #ifndef OS_API_TEST_DRVPATH
 #define OS_API_TEST_DRVPATH        "/dev/os_api_test"
@@ -90,7 +90,7 @@
 
 #ifdef CONFIG_WDOG_MMU_SCENARIO_TEST
 #ifndef _TESTIOC
-#define _TESTIOC(nr)               _IOC(_IOC_NONE, 0, nr, 0)
+#define _TESTIOC(nr)               _IOC(_TESTIOCBASE, nr)
 #endif
 #ifndef OS_API_TEST_DRVPATH
 #define OS_API_TEST_DRVPATH        "/dev/os_api_test"
@@ -102,6 +102,24 @@
 #define TESTIOC_WDOG_SCENARIO_NESTING_STRESS  _TESTIOC(40)
 #define TESTIOC_WDOG_SCENARIO_LONG_RUN        _TESTIOC(41)
 #endif /* CONFIG_WDOG_MMU_SCENARIO_TEST */
+
+#ifdef CONFIG_MMU_PAGE_PROTECT
+#ifndef _TESTIOC
+#define _TESTIOC(nr)               _IOC(_TESTIOCBASE, nr)
+#endif
+#ifndef OS_API_TEST_DRVPATH
+#define OS_API_TEST_DRVPATH        "/dev/os_api_test"
+#endif
+#define TESTIOC_AL_SPLIT              _TESTIOC(42)
+#define TESTIOC_AL_NOACCESS_RESTORE   _TESTIOC(43)
+#define TESTIOC_AL_RO_RESTORE         _TESTIOC(44)
+#define TESTIOC_AL_NOACCESS_ABORT     _TESTIOC(45)
+#define TESTIOC_AL_SPLIT_PROTECT      _TESTIOC(46)
+#define TESTIOC_AL_SMP_NOACCESS      _TESTIOC(47)
+#define TESTIOC_AL_SMP_RO             _TESTIOC(48)
+#define TESTIOC_AL_SMP_RESTORE        _TESTIOC(49)
+#define TESTIOC_AL_SMP_SPLIT          _TESTIOC(50)
+#endif /* CONFIG_MMU_PAGE_PROTECT */
 
 /* ioctl arg values: 0 = read test, 1 = write test */
 
@@ -154,6 +172,21 @@ static void mmu_protect_test_usage(void)
 	printf("  scenario_nesting     — TC-13: Nesting counter stress (1000 reentrant)\n");
 	printf("  scenario_long_run    — TC-15: Long-run stability (60s default)\n");
 	printf("                          arg: 0=60s, 1=300s, 2=86400s (24h)\n");
+#endif
+#ifdef CONFIG_MMU_PAGE_PROTECT
+	printf("\n");
+	printf("AL Layer Tests (requires CONFIG_MMU_PAGE_PROTECT):\n");
+	printf("  al_split              - TC-AL-01: Section split (safe)\n");
+	printf("  al_noaccess_restore   - TC-AL-02: No-access + restore (safe)\n");
+	printf("  al_ro_restore         - TC-AL-03: RO + restore (safe)\n");
+	printf("  al_noaccess_abort     - TC-AL-04: No-access -> Data Abort (fatal)\n");
+	printf("  al_split_protect      - TC-AL-05: Split + 4KB protect -> Data Abort (fatal)\n");
+#ifdef CONFIG_SMP
+	printf("  al_smp_noaccess       - TC-AL-06: SMP no-access -> Data Abort (fatal)\n");
+	printf("  al_smp_ro             - TC-AL-07: SMP RO write -> Data Abort (fatal)\n");
+	printf("  al_smp_restore        - TC-AL-08: SMP restore (safe)\n");
+	printf("  al_smp_split          - TC-AL-09: SMP section split (safe)\n");
+#endif
 #endif
 	printf("\n");
 
@@ -398,6 +431,74 @@ int mmu_protect_test_main(int argc, char *argv[])
 		return ret;
 	}
 #endif /* CONFIG_WDOG_MMU_SCENARIO_TEST */
+#ifdef CONFIG_MMU_PAGE_PROTECT
+	else if (strcmp(argv[1], "al_split") == 0 ||
+	         strcmp(argv[1], "al_noaccess_restore") == 0 ||
+	         strcmp(argv[1], "al_ro_restore") == 0 ||
+	         strcmp(argv[1], "al_noaccess_abort") == 0 ||
+	         strcmp(argv[1], "al_split_protect") == 0
+#ifdef CONFIG_SMP
+	         || strcmp(argv[1], "al_smp_noaccess") == 0 ||
+	         strcmp(argv[1], "al_smp_ro") == 0 ||
+	         strcmp(argv[1], "al_smp_restore") == 0 ||
+	         strcmp(argv[1], "al_smp_split") == 0
+#endif
+	         ) {
+
+		int al_cmd;
+
+		if (strcmp(argv[1], "al_split") == 0) {
+			al_cmd = TESTIOC_AL_SPLIT;
+		} else if (strcmp(argv[1], "al_noaccess_restore") == 0) {
+			al_cmd = TESTIOC_AL_NOACCESS_RESTORE;
+		} else if (strcmp(argv[1], "al_ro_restore") == 0) {
+			al_cmd = TESTIOC_AL_RO_RESTORE;
+		} else if (strcmp(argv[1], "al_noaccess_abort") == 0) {
+			al_cmd = TESTIOC_AL_NOACCESS_ABORT;
+		} else if (strcmp(argv[1], "al_split_protect") == 0) {
+			al_cmd = TESTIOC_AL_SPLIT_PROTECT;
+		}
+#ifdef CONFIG_SMP
+		else if (strcmp(argv[1], "al_smp_noaccess") == 0) {
+			al_cmd = TESTIOC_AL_SMP_NOACCESS;
+		} else if (strcmp(argv[1], "al_smp_ro") == 0) {
+			al_cmd = TESTIOC_AL_SMP_RO;
+		} else if (strcmp(argv[1], "al_smp_restore") == 0) {
+			al_cmd = TESTIOC_AL_SMP_RESTORE;
+		} else {
+			al_cmd = TESTIOC_AL_SMP_SPLIT;
+		}
+#else
+		else {
+			al_cmd = TESTIOC_AL_SPLIT;
+		}
+#endif
+
+		printf("=== AL Layer Test (%s) ===\n", argv[1]);
+		printf("[mmu_protect_test] Opening %s...\n", OS_API_TEST_DRVPATH);
+
+		fd = open(OS_API_TEST_DRVPATH, O_RDWR);
+		if (fd < 0) {
+			printf("[mmu_protect_test] FAIL: cannot open %s (errno %d)\n",
+			       OS_API_TEST_DRVPATH, errno);
+			printf("[mmu_protect_test] Is CONFIG_DRIVERS_OS_API_TEST enabled?\n");
+			return ERROR;
+		}
+
+		printf("[mmu_protect_test] Running AL test, check debug log (lldbg)\n");
+
+		ret = ioctl(fd, al_cmd, 0);
+
+		if (ret == OK) {
+			printf("[mmu_protect_test] AL test completed. Check debug log for results.\n");
+		} else {
+			printf("[mmu_protect_test] ioctl returned %d (errno %d)\n", ret, errno);
+		}
+
+		close(fd);
+		return ret;
+	}
+#endif /* CONFIG_MMU_PAGE_PROTECT */
 	else {
 
 		mmu_protect_test_usage();

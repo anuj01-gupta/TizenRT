@@ -34,7 +34,6 @@
 #include "os_api_test_proto.h"
 #include "wdog/wdog.h"
 
-
 #ifdef CONFIG_EXAMPLES_MEM_PROTECT_TEST
 #include <tinyara/binfmt/binfmt.h>
 #include <tinyara/mem_protect_test.h>
@@ -164,11 +163,72 @@ static int tc09_core1_thread(int argc, char *argv[])
 	return 0;
 }
 
+/* AL SMP: Core 1 thread for cross-core page access test
+ *
+ * Two-phase access:
+ *   Phase 0: Access page BEFORE protection (creates stale TLB entry on Core 1)
+ *   Phase 1: Access page AFTER protection (should Data Abort if fix works)
+ */
+static volatile uint32_t g_al_smp_page_addr;
+static volatile int g_al_smp_access_type;  /* 0 = read, 1 = write */
+static volatile int g_al_smp_phase1_done;  /* Core 1 completed phase 1 (pre-protection access) */
+static volatile int g_al_smp_phase2_go;    /* Core 0 signals Core 1 to do phase 2 (post-protection) */
+static volatile int g_al_smp_core1_cpu;    /* Records which CPU Core 1 thread actually ran on (-1 = not yet) */
+
+static int al_smp_core1_thread(int argc, char *argv[])
+{
+	volatile uint8_t *page = (volatile uint8_t *)g_al_smp_page_addr;
+
+	/* Record which CPU this thread is running on, for SMP verification */
+	g_al_smp_core1_cpu = up_cpu_index();
+	__asm__ volatile("dsb" ::: "memory");  /* Ensure Core 0 sees the CPU ID write */
+
+	lldbg("AL SMP: Core 1 thread started on CPU%d (pid=%d), page=0x%08x, access=%s\n",
+	      g_al_smp_core1_cpu, getpid(), g_al_smp_page_addr,
+	      g_al_smp_access_type ? "write" : "read");
+
+	/* Phase 1: Access page BEFORE protection — creates stale TLB entry */
+	lldbg("AL SMP: Phase 1 — accessing page BEFORE protection (creates stale TLB)\n");
+	if (g_al_smp_access_type == 0) {
+		volatile uint8_t val = page[0];
+		(void)val;
+		lldbg("AL SMP: Phase 1 read OK (val=0x%02x) — TLB now has RW entry on Core 1\n", val);
+	} else {
+		page[0] = 0xBB;
+		lldbg("AL SMP: Phase 1 write OK — TLB now has RW entry on Core 1\n");
+	}
+
+	/* Signal Core 0 that phase 1 is done */
+	g_al_smp_phase1_done = 1;
+
+	/* Wait for Core 0 to protect the page and signal us */
+	lldbg("AL SMP: Waiting for Core 0 to protect page...\n");
+	while (!g_al_smp_phase2_go) {
+		__asm__ volatile("dmb" ::: "memory");
+		up_mdelay(1);
+	}
+	__asm__ volatile("dmb" ::: "memory");  /* Ensure we see the protected PTE before accessing */
+
+	/* Phase 2: Access page AFTER protection — should Data Abort if fix works */
+	lldbg("AL SMP: Phase 2 — accessing page AFTER protection (expect Data Abort)\n");
+	if (g_al_smp_access_type == 0) {
+		lldbg("AL SMP: >>> Core 1 READ, expect Data Abort <<<\n");
+		volatile uint8_t val = page[0];
+		(void)val;
+		lldbg("AL SMP: ERROR — read succeeded (no Data Abort)! DEFECT REPRODUCED!\n");
+	} else {
+		lldbg("AL SMP: >>> Core 1 WRITE, expect Data Abort <<<\n");
+		page[0] = 0xCC;
+		lldbg("AL SMP: ERROR — write succeeded (no Data Abort)! DEFECT REPRODUCED!\n");
+	}
+
+	return 0;
+}
+
 static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
 {
 	int ret = -EINVAL;
 	/* Handle built-in ioctl commands */
-
 
 	switch (cmd) {
 	/* TESTFWIOC_DRIVER_ANALOG - Run the test case for /os/driver/analog module
@@ -222,7 +282,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 	case TESTIOC_MEM_PROTECTTEST:
 		ret = OK;
 		struct mem_protecttest_arg_s *obj = (struct mem_protecttest_arg_s*)arg;
-		
 		if (!obj) {
 			return -EINVAL;
 		}
@@ -284,7 +343,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = test_fs_get_devname();
 		break;
 #endif
-#ifdef CONFIG_EXAMPLES_MMU_PROTECT_TEST
+#if defined(CONFIG_EXAMPLES_MMU_PROTECT_TEST) && defined(CONFIG_MMU_PAGE_PROTECT)
 	case TESTIOC_UAF_MMU_PROTECT: {
 		/* Use-after-free detection via MMU page protection.
 		 *
@@ -410,11 +469,532 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = OK;
 		break;
 	}
+
+	/* TC-AL-01: Section split verification (Safe) */
+	case TESTIOC_AL_SPLIT: {
+		uint8_t *buf;
+		uint32_t page_addr;
+
+		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
+		if (!buf) {
+			lldbg("AL SPLIT: kmm_memalign failed\n");
+			return -ENOMEM;
+		}
+		page_addr = ((uint32_t)buf + 4095) & ~4095u;
+
+		lldbg("AL SPLIT: page=0x%08x, calling mmu_split_section_to_l2\n", page_addr);
+
+		mmu_split_section_to_l2(page_addr);
+
+		/* Verify memory is still accessible after split */
+		memset((void *)page_addr, 0xAA, 4096);
+		lldbg("AL SPLIT: memory read/write OK after split\n");
+
+		kmm_free(buf);
+		ret = OK;
+		break;
+	}
+
+	/* TC-AL-02: No-access + restore round-trip (Safe) */
+	case TESTIOC_AL_NOACCESS_RESTORE: {
+		uint8_t *buf;
+		uint32_t page_addr;
+		uint32_t saved_pte;
+
+		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
+		if (!buf) {
+			lldbg("AL NOACCESS_RESTORE: kmm_memalign failed\n");
+			return -ENOMEM;
+		}
+		page_addr = ((uint32_t)buf + 4095) & ~4095u;
+		memset((void *)page_addr, 0xAA, 4096);
+
+		saved_pte = mmu_save_page_pte(page_addr);
+		lldbg("AL NOACCESS_RESTORE: saved_pte=0x%08x\n", saved_pte);
+
+		mmu_set_page_no_access(page_addr);
+		lldbg("AL NOACCESS_RESTORE: page set to No-Access\n");
+
+		mmu_restore_page_pte(page_addr, saved_pte);
+		lldbg("AL NOACCESS_RESTORE: page restored\n");
+
+		/* Verify access works after restore */
+		((volatile uint8_t *)page_addr)[0] = 0xBB;
+		lldbg("AL NOACCESS_RESTORE: write after restore OK\n");
+
+		kmm_free(buf);
+		ret = OK;
+		break;
+	}
+
+	/* TC-AL-03: RO + restore round-trip (Safe) */
+	case TESTIOC_AL_RO_RESTORE: {
+		uint8_t *buf;
+		uint32_t page_addr;
+		uint32_t saved_pte;
+		volatile uint8_t val;
+
+		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
+		if (!buf) {
+			lldbg("AL RO_RESTORE: kmm_memalign failed\n");
+			return -ENOMEM;
+		}
+		page_addr = ((uint32_t)buf + 4095) & ~4095u;
+		memset((void *)page_addr, 0xAA, 4096);
+
+		saved_pte = mmu_save_page_pte(page_addr);
+		lldbg("AL RO_RESTORE: saved_pte=0x%08x\n", saved_pte);
+
+		mmu_set_page_ro(page_addr);
+		lldbg("AL RO_RESTORE: page set to Read-Only\n");
+
+		/* Read should succeed under RO */
+		val = ((volatile uint8_t *)page_addr)[0];
+		lldbg("AL RO_RESTORE: read under RO OK, val=0x%02x\n", val);
+
+		mmu_restore_page_pte(page_addr, saved_pte);
+		lldbg("AL RO_RESTORE: page restored\n");
+
+		/* Write should succeed after restore */
+		((volatile uint8_t *)page_addr)[0] = 0xCC;
+		lldbg("AL RO_RESTORE: write after restore OK\n");
+
+		kmm_free(buf);
+		ret = OK;
+		break;
+	}
+
+	/* TC-AL-04: No-access triggers Data Abort (Fatal)
+	 *
+	 * Sets an entire 1MB section to No-Access WITHOUT splitting to 4KB.
+	 * Since the kernel heap (and TCB) reside in the same 1MB section,
+	 * the Data Abort handler itself faults → nested Data Abort.
+	 *
+	 * This nested abort is EXPECTED — it proves split_section_to_l2()
+	 * is required before page-level protection in kernel context.
+	 * See AL-05 for the correct approach (split first, then protect 4KB).
+	 */
+	case TESTIOC_AL_NOACCESS_ABORT: {
+		uint8_t *buf;
+		uint32_t page_addr;
+		uint32_t saved_pte;
+		volatile uint8_t val;
+#ifdef CONFIG_SMP
+		cpu_set_t cpu_mask;
+		cpu_set_t orig_mask;
+#endif
+
+		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
+		if (!buf) {
+			lldbg("AL NOACCESS_ABORT: kmm_memalign failed\n");
+			return -ENOMEM;
+		}
+		page_addr = ((uint32_t)buf + 4095) & ~4095u;
+		memset((void *)page_addr, 0xAA, 4096);
+
+#ifdef CONFIG_SMP
+		/* Pin to Core 0 — single-core test, prevent scheduler migration */
+		sched_getaffinity(getpid(), sizeof(cpu_set_t), &orig_mask);
+		CPU_ZERO(&cpu_mask);
+		CPU_SET(0, &cpu_mask);
+		sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpu_mask);
+		lldbg("AL NOACCESS_ABORT: Pinned to CPU 0 (was CPU %d)\n", up_cpu_index());
+#endif
+
+		lldbg("AL NOACCESS_ABORT: Setting 1MB section to No-Access (NO split)\n");
+		lldbg("AL NOACCESS_ABORT: page 0x%08x is in 1MB section with TCB/stacks\n", page_addr);
+
+		saved_pte = mmu_save_page_pte(page_addr);
+		mmu_set_page_no_access(page_addr);
+		lldbg("AL NOACCESS_ABORT: 1MB section set to No-Access on CPU %d\n", up_cpu_index());
+		lldbg("AL NOACCESS_ABORT: >>> READ, expect Data Abort <<<\n");
+		lldbg("AL NOACCESS_ABORT: NOTE: Nested Data Abort is EXPECTED here!\n");
+		lldbg("AL NOACCESS_ABORT:   Reason: 1MB section contains TCB/stacks.\n");
+		lldbg("AL NOACCESS_ABORT:   Abort handler accesses TCB → nested abort.\n");
+		lldbg("AL NOACCESS_ABORT:   This proves split_section_to_l2() is required.\n");
+		lldbg("AL NOACCESS_ABORT:   See AL-05 for correct approach (split first).\n");
+
+		val = ((volatile uint8_t *)page_addr)[0];
+		(void)val;
+
+		lldbg("AL NOACCESS_ABORT: ERROR — no Data Abort occurred!\n");
+		mmu_restore_page_pte(page_addr, saved_pte);
+#ifdef CONFIG_SMP
+		sched_setaffinity(getpid(), sizeof(cpu_set_t), &orig_mask);
+#endif
+		kmm_free(buf);
+		ret = -EIO;
+		break;
+	}
+
+	/* TC-AL-05: Split + 4KB-granular protect (Fatal, single-core) */
+	case TESTIOC_AL_SPLIT_PROTECT: {
+		uint8_t *buf;
+		uint32_t page_addr;
+		uint32_t other_page;
+		uint32_t saved_pte;
+		volatile uint8_t val;
+#ifdef CONFIG_SMP
+		cpu_set_t cpu_mask;
+		cpu_set_t orig_mask;
+#endif
+
+		buf = (uint8_t *)kmm_memalign(4096, 4096 * 4);
+		if (!buf) {
+			lldbg("AL SPLIT_PROTECT: kmm_memalign failed\n");
+			return -ENOMEM;
+		}
+		page_addr = ((uint32_t)buf + 4095) & ~4095u;
+		other_page = page_addr + 8192; /* different 4KB page in same 1MB */
+
+		memset((void *)page_addr, 0xAA, 4096);
+		memset((void *)other_page, 0xBB, 4096);
+
+#ifdef CONFIG_SMP
+		/* Pin to Core 0 — single-core test, prevent scheduler migration */
+		sched_getaffinity(getpid(), sizeof(cpu_set_t), &orig_mask);
+		CPU_ZERO(&cpu_mask);
+		CPU_SET(0, &cpu_mask);
+		sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpu_mask);
+		lldbg("AL SPLIT_PROTECT: Pinned to CPU 0 (was CPU %d)\n", up_cpu_index());
+#endif
+
+		mmu_split_section_to_l2(page_addr);
+		lldbg("AL SPLIT_PROTECT: section split on CPU %d\n", up_cpu_index());
+
+		saved_pte = mmu_save_page_pte(page_addr);
+		mmu_set_page_no_access(page_addr);
+		lldbg("AL SPLIT_PROTECT: page 0x%08x protected on CPU %d\n",
+		      page_addr, up_cpu_index());
+
+		/* Read different page — should succeed (proves only 4KB is protected) */
+		val = ((volatile uint8_t *)other_page)[0];
+		lldbg("AL SPLIT_PROTECT: other page read OK, val=0x%02x\n", val);
+
+		/* Read protected page — Data Abort */
+		lldbg("AL SPLIT_PROTECT: >>> READ protected page on CPU %d, expect Data Abort <<<\n",
+		      up_cpu_index());
+		val = ((volatile uint8_t *)page_addr)[0];
+		(void)val;
+
+		lldbg("AL SPLIT_PROTECT: ERROR — access succeeded!\n");
+		mmu_restore_page_pte(page_addr, saved_pte);
+#ifdef CONFIG_SMP
+		sched_setaffinity(getpid(), sizeof(cpu_set_t), &orig_mask);
+#endif
+		kmm_free(buf);
+		ret = -EIO;
+		break;
+	}
+
+#ifdef CONFIG_SMP
+	/* TC-AL-06: SMP cross-core no-access (Fatal)
+	 *
+	 * Two-phase test to properly reproduce the SMP TLB defect:
+	 *   Phase 1: Core 1 reads page (TLB gets RW entry)
+	 *   Phase 2: Core 0 protects page, Core 1 reads again
+	 *     Without fix: stale TLB → read succeeds (defect)
+	 *     With fix: TLB flushed → Data Abort (protection works)
+	 */
+	case TESTIOC_AL_SMP_NOACCESS: {
+		uint8_t *buf;
+		uint32_t page_addr;
+		pid_t core1_pid;
+		cpu_set_t cpu_mask;
+
+		/* B8: Verify SMP is actually available */
+#ifndef CONFIG_SMP
+		lldbg("AL SMP_NOACCESS: CONFIG_SMP not enabled — test is meaningless, skipping\n");
+		return -ENOTSUP;
+#endif
+#if CONFIG_SMP_NCPUS < 2
+		lldbg("AL SMP_NOACCESS: only %d CPU(s) — need >= 2, skipping\n", CONFIG_SMP_NCPUS);
+		return -ENOTSUP;
+#endif
+		/* Log which CPU the ioctl is running on */
+		lldbg("AL SMP_NOACCESS: Core 0 (ioctl) running on CPU%d\n", up_cpu_index());
+
+		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
+		if (!buf) {
+			lldbg("AL SMP_NOACCESS: kmm_memalign failed\n");
+			return -ENOMEM;
+		}
+		page_addr = ((uint32_t)buf + 4095) & ~4095u;
+		memset((void *)page_addr, 0xAA, 4096);
+
+		/* Set up globals for Core 1 thread */
+		g_al_smp_page_addr = page_addr;
+		g_al_smp_access_type = 0;  /* read */
+		g_al_smp_phase1_done = 0;
+		g_al_smp_phase2_go = 0;
+		g_al_smp_core1_cpu = -1;
+
+		/* Spawn Core 1 thread — it will access page BEFORE protection */
+		core1_pid = kernel_thread("al_smp_c1", 100, 2048,
+		                          al_smp_core1_thread, NULL);
+		if (core1_pid < 0) {
+			lldbg("AL SMP_NOACCESS: kernel_thread() failed (%d)\n", core1_pid);
+			kmm_free(buf);
+			ret = -ENOMEM;
+			break;
+		}
+
+		/* Pin the thread to Core 1 (CPU 1) */
+		CPU_ZERO(&cpu_mask);
+		CPU_SET(1, &cpu_mask);
+		if (sched_setaffinity(core1_pid, sizeof(cpu_set_t),
+		                      &cpu_mask) != OK) {
+			lldbg("AL SMP_NOACCESS: sched_setaffinity() failed — aborting test\n");
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+		lldbg("AL SMP_NOACCESS: Core 1 thread pinned to CPU 1 (pid=%d)\n",
+		      core1_pid);
+
+		/* Wait for Core 1 to complete phase 1 (pre-protection access) */
+		lldbg("AL SMP_NOACCESS: Waiting for Core 1 phase 1 (pre-protection read)...\n");
+		int wait_count = 0;
+		while (!g_al_smp_phase1_done && wait_count < 1000) {
+			__asm__ volatile("dmb" ::: "memory");
+			up_mdelay(1);
+			wait_count++;
+		}
+		if (!g_al_smp_phase1_done) {
+			lldbg("AL SMP_NOACCESS: ERROR — Core 1 phase 1 timeout!\n");
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+
+		/* B7: Verify Core 1 actually ran on CPU 1 */
+		if (g_al_smp_core1_cpu != 1) {
+			lldbg("AL SMP_NOACCESS: ERROR — Core 1 thread ran on CPU%d, not CPU1!\n",
+			      g_al_smp_core1_cpu);
+			lldbg("AL SMP_NOACCESS: SMP test is INVALID — thread did not run on a different core\n");
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+		lldbg("AL SMP_NOACCESS: Verified — Core 1 thread ran on CPU%d ✓\n",
+		      g_al_smp_core1_cpu);
+		lldbg("AL SMP_NOACCESS: Core 1 phase 1 done — TLB has stale RW entry\n");
+
+		/* Now protect the page — Core 1's TLB still has old RW entry.
+		 * Must split the 1MB L1 section into 4KB L2 pages first, otherwise
+		 * mmu_set_page_no_access() would protect the entire 1MB section
+		 * (including TCB), causing a nested Data Abort in the abort handler. */
+		mmu_split_section_to_l2(page_addr);
+		mmu_set_page_no_access(page_addr);
+		lldbg("AL SMP_NOACCESS: Core 0 protected page 0x%08x (No-Access)\n", page_addr);
+
+		/* Diagnostic: read DACR from Core 0's perspective after protection */
+		{
+			uint32_t dacr;
+			__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr));
+			lldbg("POST_PROTECT: Core0 DACR=0x%08x (dom0=%s)\n",
+			      dacr,
+			      (dacr & 0x3) == 0 ? "NO_ACCESS" :
+			      (dacr & 0x3) == 1 ? "CLIENT" :
+			      (dacr & 0x3) == 3 ? "MANAGER" : "RESERVED");
+		}
+
+		/* Signal Core 1 to do phase 2 (post-protection access) */
+		g_al_smp_phase2_go = 1;
+		__asm__ volatile("dsb" ::: "memory");  /* Ensure Core 1 sees the signal */
+		lldbg("AL SMP_NOACCESS: >>> Core 1 READ again, expect Data Abort <<<\n");
+
+		/* Wait for Core 1 thread — it should Data Abort */
+		up_mdelay(100);
+
+		/* If we reach here, Data Abort did NOT occur (defect reproduced) */
+		lldbg("AL SMP_NOACCESS: ERROR — no Data Abort! DEFECT REPRODUCED!\n");
+		ret = -EIO;
+		break;
+	}
+
+	/* TC-AL-07: SMP cross-core RO (Fatal)
+	 *
+	 * Two-phase test to properly reproduce the SMP TLB defect:
+	 *   Phase 1: Core 1 writes page (TLB gets RW entry)
+	 *   Phase 2: Core 0 sets page RO, Core 1 writes again
+	 *     Without fix: stale TLB → write succeeds (defect)
+	 *     With fix: TLB flushed → Data Abort (protection works)
+	 */
+	case TESTIOC_AL_SMP_RO: {
+		uint8_t *buf;
+		uint32_t page_addr;
+		pid_t core1_pid;
+		cpu_set_t cpu_mask;
+
+		/* B8: Verify SMP is actually available */
+#ifndef CONFIG_SMP
+		lldbg("AL SMP_RO: CONFIG_SMP not enabled — test is meaningless, skipping\n");
+		return -ENOTSUP;
+#endif
+#if CONFIG_SMP_NCPUS < 2
+		lldbg("AL SMP_RO: only %d CPU(s) — need >= 2, skipping\n", CONFIG_SMP_NCPUS);
+		return -ENOTSUP;
+#endif
+		/* Log which CPU the ioctl is running on */
+		lldbg("AL SMP_RO: Core 0 (ioctl) running on CPU%d\n", up_cpu_index());
+
+		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
+		if (!buf) {
+			lldbg("AL SMP_RO: kmm_memalign failed\n");
+			return -ENOMEM;
+		}
+		page_addr = ((uint32_t)buf + 4095) & ~4095u;
+		memset((void *)page_addr, 0xAA, 4096);
+
+		/* Set up globals for Core 1 thread */
+		g_al_smp_page_addr = page_addr;
+		g_al_smp_access_type = 1;  /* write */
+		g_al_smp_phase1_done = 0;
+		g_al_smp_phase2_go = 0;
+		g_al_smp_core1_cpu = -1;
+
+		/* Spawn Core 1 thread — it will access page BEFORE protection */
+		core1_pid = kernel_thread("al_smp_c1", 100, 2048,
+		                          al_smp_core1_thread, NULL);
+		if (core1_pid < 0) {
+			lldbg("AL SMP_RO: kernel_thread() failed (%d)\n", core1_pid);
+			kmm_free(buf);
+			ret = -ENOMEM;
+			break;
+		}
+
+		/* Pin the thread to Core 1 (CPU 1) */
+		CPU_ZERO(&cpu_mask);
+		CPU_SET(1, &cpu_mask);
+		if (sched_setaffinity(core1_pid, sizeof(cpu_set_t),
+		                      &cpu_mask) != OK) {
+			lldbg("AL SMP_RO: sched_setaffinity() failed — aborting test\n");
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+		lldbg("AL SMP_RO: Core 1 thread pinned to CPU 1 (pid=%d)\n",
+		      core1_pid);
+
+		/* Wait for Core 1 to complete phase 1 (pre-protection access) */
+		lldbg("AL SMP_RO: Waiting for Core 1 phase 1 (pre-protection write)...\n");
+		int wait_count = 0;
+		while (!g_al_smp_phase1_done && wait_count < 1000) {
+			__asm__ volatile("dmb" ::: "memory");
+			up_mdelay(1);
+			wait_count++;
+		}
+		if (!g_al_smp_phase1_done) {
+			lldbg("AL SMP_RO: ERROR — Core 1 phase 1 timeout!\n");
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+
+		/* B7: Verify Core 1 actually ran on CPU 1 */
+		if (g_al_smp_core1_cpu != 1) {
+			lldbg("AL SMP_RO: ERROR — Core 1 thread ran on CPU%d, not CPU1!\n",
+			      g_al_smp_core1_cpu);
+			lldbg("AL SMP_RO: SMP test is INVALID — thread did not run on a different core\n");
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+		lldbg("AL SMP_RO: Verified — Core 1 thread ran on CPU%d ✓\n",
+		      g_al_smp_core1_cpu);
+		lldbg("AL SMP_RO: Core 1 phase 1 done — TLB has stale RW entry\n");
+
+		/* Now set the page to RO — Core 1's TLB still has old RW entry.
+		 * Must split the 1MB L1 section into 4KB L2 pages first, otherwise
+		 * mmu_set_page_ro() would protect the entire 1MB section
+		 * (including TCB), causing incorrect protection. */
+		mmu_split_section_to_l2(page_addr);
+		mmu_set_page_ro(page_addr);
+		lldbg("AL SMP_RO: Core 0 set page 0x%08x to RO\n", page_addr);
+
+		/* Diagnostic: read DACR from Core 0's perspective after protection */
+		{
+			uint32_t dacr;
+			__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr));
+			lldbg("POST_PROTECT: Core0 DACR=0x%08x (dom0=%s)\n",
+			      dacr,
+			      (dacr & 0x3) == 0 ? "NO_ACCESS" :
+			      (dacr & 0x3) == 1 ? "CLIENT" :
+			      (dacr & 0x3) == 3 ? "MANAGER" : "RESERVED");
+		}
+
+		/* Signal Core 1 to do phase 2 (post-protection access) */
+		g_al_smp_phase2_go = 1;
+		__asm__ volatile("dsb" ::: "memory");  /* Ensure Core 1 sees the signal */
+		lldbg("AL SMP_RO: >>> Core 1 WRITE again, expect Data Abort <<<\n");
+
+		/* Wait for Core 1 thread — it should Data Abort */
+		up_mdelay(100);
+
+		/* If we reach here, Data Abort did NOT occur (defect reproduced) */
+		lldbg("AL SMP_RO: ERROR — no Data Abort! DEFECT REPRODUCED!\n");
+		ret = -EIO;
+		break;
+	}
+#endif /* CONFIG_SMP */
+
+	/* TC-AL-08: Page protect + restore round-trip (Safe, single-core) */
+	case TESTIOC_AL_SMP_RESTORE: {
+		uint8_t *buf;
+		uint32_t page_addr;
+		uint32_t saved_pte;
+
+		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
+		if (!buf) {
+			lldbg("AL RESTORE: kmm_memalign failed\n");
+			return -ENOMEM;
+		}
+		page_addr = ((uint32_t)buf + 4095) & ~4095u;
+		memset((void *)page_addr, 0xAA, 4096);
+
+		saved_pte = mmu_save_page_pte(page_addr);
+		mmu_set_page_no_access(page_addr);
+		mmu_restore_page_pte(page_addr, saved_pte);
+		lldbg("AL RESTORE: protect+restore done, page accessible\n");
+
+		((volatile uint8_t *)page_addr)[0] = 0xBB;
+		lldbg("AL RESTORE: write OK\n");
+
+		kmm_free(buf);
+		ret = OK;
+		break;
+	}
+
+	/* TC-AL-09: Section split (Safe, single-core) */
+	case TESTIOC_AL_SMP_SPLIT: {
+		uint8_t *buf;
+		uint32_t page_addr;
+
+		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
+		if (!buf) {
+			lldbg("AL SPLIT: kmm_memalign failed\n");
+			return -ENOMEM;
+		}
+		page_addr = ((uint32_t)buf + 4095) & ~4095u;
+
+		mmu_split_section_to_l2(page_addr);
+		lldbg("AL SPLIT: section split, accessible\n");
+
+		memset((void *)page_addr, 0xAA, 4096);
+		lldbg("AL SPLIT: write OK\n");
+
+		kmm_free(buf);
+		ret = OK;
+		break;
+	}
+#endif /* CONFIG_EXAMPLES_MMU_PROTECT_TEST && CONFIG_MMU_PAGE_PROTECT */
+
+#ifdef CONFIG_EXAMPLES_MMU_PROTECT_TEST
 	case TESTIOC_WDOG_MMU_PROTECT_TEST: {
 		/* Verify watchdog MMU page protection.
 		 *
 		 * This test accesses the wdog static data page (g_wdpool) from
-
 		 * OUTSIDE wdog code — i.e. without calling wd_mmu_write_begin().
 		 *
 		 * Step 1: Read from the wdog page — should succeed (page is
@@ -431,15 +1011,11 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		 * arg = 1: write (crash if protection enabled)
 		 */
 		volatile uint8_t *wdog_page = (volatile uint8_t *)&g_wdpool;
-
-
 		int do_write = (arg == 1);
 		irqstate_t irq_state;
 
 		lldbg("WDOG MMU protect test: wdog data at 0x%08x\n",
 		      (uint32_t)wdog_page);
-
-
 		/* Step 1: Read — should always succeed (Read-Only allows reads) */
 		lldbg("WDOG MMU protect test: reading wdog page (should succeed)...\n");
 		volatile uint8_t val = wdog_page[0];
@@ -451,7 +1027,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 			 * we are NOT inside wd_mmu_write_begin()/wd_mmu_write_end().
 			 *
 			 * DFAR will contain &g_wdpool — the protected wdog address.
-
 			 *
 			 * If protection is NOT enabled, the write succeeds.  We
 			 * disable interrupts and save/restore the original byte
@@ -692,7 +1267,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 	}
 #endif /* CONFIG_WDOG_MMU_DEFECT_TEST_HEAP_OVERLAP */
 
-
 #ifdef CONFIG_WDOG_MMU_DEFECT_TEST_WD_RECOVER
 	case TESTIOC_WDOG_DEFECT_WD_RECOVER: {
 		/* Defect #11: wd_recover() missing protection.
@@ -784,7 +1358,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 
 #ifdef CONFIG_WDOG_MMU_DEFECT_TEST_BOOT_ORDER
 	case TESTIOC_WDOG_DEFECT_BOOT_ORDER: {
-
 		/* Defect #13: Boot order issue.
 		 *
 		 * wd_mmu_protect_init() is called at the end of wd_initialize().
@@ -930,7 +1503,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		lldbg("=== TC-06: Multiple watchdog expiration in same tick ===\n");
 		g_tc06_callback_count = 0;
 
-
 		/* Create and start 5 watchdogs with the same 1-tick delay */
 		for (i = 0; i < TC06_NUM_WDOGS; i++) {
 			wdogs[i] = wd_create();
@@ -948,7 +1520,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 				goto tc06_cleanup;
 			}
 		}
-
 
 		lldbg("TC06: Started %d watchdogs with 10-tick delay, waiting...\n",
 		      TC06_NUM_WDOGS);
@@ -1115,7 +1686,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 	}
 #endif /* CONFIG_WDOG_MMU_SCENARIO_TEST_SMP_CONCURRENT */
 
-
 #ifdef CONFIG_WDOG_MMU_SCENARIO_TEST_SMP_TICK_CB
 	case TESTIOC_WDOG_SCENARIO_SMP_TICK_CB: {
 		/* TC-09: SMP timer tick on Core 0, callback on Core 1.
@@ -1142,7 +1712,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		g_tc09_callback_fired = 0;
 		g_tc09_core1_done = 0;
 		g_tc09_wdog = NULL;
-
 
 #ifdef CONFIG_SMP
 		lldbg("TC09: SMP is enabled — creating Core 1 thread\n");
@@ -1218,11 +1787,8 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 			g_tc09_wdog = NULL;
 		}
 		break;
-
 	}
 #endif /* CONFIG_WDOG_MMU_SCENARIO_TEST_SMP_TICK_CB */
-
-
 
 #ifdef CONFIG_WDOG_MMU_SCENARIO_TEST_NESTING_STRESS
 	case TESTIOC_WDOG_SCENARIO_NESTING_STRESS: {
@@ -1287,7 +1853,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		WDOG_ID wdog;
 		int total_ops = 0;
 
-
 		if (arg == 1) {
 			duration_sec = 300;
 		} else if (arg == 2) {
@@ -1332,10 +1897,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 #endif /* CONFIG_WDOG_MMU_SCENARIO_TEST */
 
 	default:
-
-
-
-
 		vdbg("Unrecognized cmd: %d arg: %ld\n", cmd, arg);
 		break;
 
@@ -1343,8 +1904,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 
 	return ret;
 }
-
-
 static ssize_t os_api_test_drv_read(FAR struct file *filep, FAR char *buffer, size_t len)
 {
 	return 0;                                       /* Return EOF */

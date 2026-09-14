@@ -116,6 +116,21 @@ config ARCH_USE_MMU
 		really an option: It is required to use the MMU. In those
 		cases, this selection will always be forced.
 
+config MMU_PAGE_PROTECT
+	bool "MMU page-level protection API"
+	default n
+	depends on ARCH_USE_MMU && !ARCH_ROMPGTABLE
+	---help---
+		Enable the MMU page protection abstraction layer.
+		Provides mmu_split_section_to_l2(), mmu_save_page_pte(),
+		mmu_set_page_no_access(), mmu_set_page_ro(), and
+		mmu_restore_page_pte() for 4KB-granular page protection.
+
+		SMP compatible — uses inner-shareable TLB broadcast
+		invalidation when CONFIG_SMP is enabled.
+
+		Currently untested — enable only for development.
+
 config ARCH_HAVE_FETCHADD
         bool
         default n

@@ -1665,7 +1665,7 @@ void mmu_invalidate_region(uint32_t vstart, size_t size);
  *
  ****************************************************************************/
 
-#ifndef CONFIG_ARCH_ROMPGTABLE
+#ifdef CONFIG_MMU_PAGE_PROTECT
 uint32_t mmu_save_page_pte(uint32_t vaddr);
 #endif
 
@@ -1682,7 +1682,7 @@ uint32_t mmu_save_page_pte(uint32_t vaddr);
  *
  ****************************************************************************/
 
-#ifndef CONFIG_ARCH_ROMPGTABLE
+#ifdef CONFIG_MMU_PAGE_PROTECT
 void mmu_set_page_no_access(uint32_t vaddr);
 #endif
 
@@ -1699,7 +1699,7 @@ void mmu_set_page_no_access(uint32_t vaddr);
  *
  ****************************************************************************/
 
-#ifndef CONFIG_ARCH_ROMPGTABLE
+#ifdef CONFIG_MMU_PAGE_PROTECT
 void mmu_set_page_ro(uint32_t vaddr);
 #endif
 
@@ -1716,7 +1716,7 @@ void mmu_set_page_ro(uint32_t vaddr);
  *
  ****************************************************************************/
 
-#ifndef CONFIG_ARCH_ROMPGTABLE
+#ifdef CONFIG_MMU_PAGE_PROTECT
 void mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte);
 #endif
 

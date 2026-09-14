@@ -52,7 +52,17 @@
 #include "up_internal.h"
 #include "gic.h"
 
+#ifdef CONFIG_MMU_PAGE_PROTECT
+#ifdef CONFIG_SMP
+/* Declaration of SGI4 handler for SMP TLB flush.
+ * Defined in arm_mmu.c
+ */
+extern int mmu_tlb_flush_sgi_handler(int irq, void *context, void *arg);
+#endif
+#endif
+
 #ifdef CONFIG_ARMV7A_HAVE_GICv2
+
 
 /****************************************************************************
  * Public Functions
@@ -126,7 +136,11 @@ void arm_gic0_initialize(void)
 #ifdef CONFIG_CPU_HOTPLUG
   DEBUGVERIFY(irq_attach(GIC_IRQ_SGI3, arm_hotplug_handler, NULL));
 #endif
+#ifdef CONFIG_MMU_PAGE_PROTECT
+  DEBUGVERIFY(irq_attach(GIC_IRQ_SGI4, mmu_tlb_flush_sgi_handler, NULL));
 #endif
+#endif
+
 
 	arm_gic_dump("Exit arm_gic0_initialize", true, 0);
 }
