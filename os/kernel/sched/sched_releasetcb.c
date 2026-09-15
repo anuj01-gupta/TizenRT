@@ -62,6 +62,9 @@
 
 #include <tinyara/arch.h>
 #include <tinyara/sched.h>
+#ifdef CONFIG_MM_KASAN
+#include <tinyara/mm/kasan.h>
+#endif
 
 #include "sched/sched.h"
 #include "group/group.h"
@@ -175,6 +178,28 @@ int sched_releasetcb(FAR struct tcb_s *tcb, uint8_t ttype)
 #endif
 			{
 				up_release_stack(tcb, ttype);
+
+#ifdef CONFIG_MM_KASAN
+				/* The task being released may still be executing on this
+				 * stack. Two paths do that: the self-exit path (_exit() ->
+				 * task_exit() -> task_terminate() -> here) frees the
+				 * current task's own stack and keeps running on it until
+				 * arm_fullcontextrestore() switches away, and on SMP a task
+				 * deleted from another CPU keeps running until it is
+				 * switched out. up_release_stack() just poisoned the block,
+				 * so every instrumented access of the dying task's last
+				 * instructions - including the SVC exception frame that
+				 * arm_syscall() reads - would be reported as a
+				 * use-after-free and panic the board.
+				 *
+				 * Unpoison it: the block is free, but the dying task's
+				 * remaining execution on it is legitimate. The allocator
+				 * re-poisons the block when it is handed out and freed
+				 * again, so detection is lost only for this one window.
+				 */
+
+				kasan_unpoison(tcb->stack_alloc_ptr, tcb->adj_stack_size);
+#endif
 			}
 		}
 #ifdef CONFIG_PIC

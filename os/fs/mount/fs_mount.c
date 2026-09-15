@@ -393,7 +393,12 @@ errout_with_mountpt:
 	}
 #endif
 
-	inode_release(mountpt_inode);
+	/* inode_remove() above already unlinked the mountpoint inode and,
+	 * because i_crefs was forced to zero, freed it with kmm_free().
+	 * Releasing it again here reads the inode after free, which KASan
+	 * reports as a use-after-free. Do not touch mountpt_inode again.
+	 */
+
 	goto errout;
 
 errout_with_semaphore:
