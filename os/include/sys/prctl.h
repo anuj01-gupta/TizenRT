@@ -134,7 +134,8 @@ enum prctl_type_e {
 	PR_REBOOT_REASON_CLEAR,
 	PR_SET_SECURITY_LEVEL,
 	PR_GET_SECURITY_LEVEL,
-	PR_GET_TGTASK
+	PR_GET_TGTASK,
+	PR_KASAN_SELFTEST
 };
 
 /****************************************************************************

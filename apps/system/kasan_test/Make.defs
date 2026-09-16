@@ -1,6 +1,6 @@
 ###########################################################################
 #
-# Copyright 2017 Samsung Electronics All Rights Reserved.
+# Copyright 2026 Samsung Electronics All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,33 +15,16 @@
 # language governing permissions and limitations under the License.
 #
 ###########################################################################
+############################################################################
+# apps/system/kasan_test/Make.defs
+# Adds selected applications to apps/ build
+#
+############################################################################
 
-ifeq ($(CONFIG_DEBUG_SYSTEM),y)
-CSRCS += sysdbg.c
-endif
-
-ifeq ($(CONFIG_MEM_LEAK_CHECKER),y)
-CSRCS += mem_leak_checker.c
-endif
-
-# Built here rather than under mm/ because mm/ is compiled with
-# -fno-sanitize=kernel-address, so an access made from there is never checked
-# and the deliberate errors would go unreported.
+# Gated on the kernel side option rather than one of its own. The app is only
+# a way to reach PR_KASAN_SELFTEST, so there is nothing for it to do when the
+# kernel was not built with the test it calls.
 
 ifeq ($(CONFIG_MM_KASAN_SELFTEST),y)
-CSRCS += kasan_selftest.c
+CONFIGURED_APPS += system/kasan_test
 endif
-
-CSRCS += dbg_termination_info.c
-ifeq ($(CONFIG_DEBUG_MM_WARN),y)
-CSRCS += memdbg.c
-endif
-
-ifeq ($(CONFIG_ENABLE_STACKMONITOR)$(CONFIG_DEBUG),yy)
-ifneq ($(CONFIG_STACKMONITOR_DISABLE_DEAD_THREAD),y)
-CSRCS += stackinfo_save_terminated.c
-endif
-endif
-
-DEPPATH += --dep-path debug
-VPATH += :debug

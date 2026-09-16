@@ -107,6 +107,26 @@ config MM_KASAN_REGIONS
 		Registration of a region beyond this limit is refused with a
 		message and that region is left unchecked.
 
+config MM_KASAN_SELFTEST
+	bool "Self test"
+	default n
+	---help---
+		Build kernel/debug/kasan_selftest.c, which performs one deliberate
+		memory error against the kernel heap on request, and the
+		PR_KASAN_SELFTEST prctl that user space uses to ask for it.
+
+		A system with no memory errors and a system where instrumentation
+		was never emitted are both silent, so a clean boot on its own says
+		nothing about whether KASan is working. This is what tells them
+		apart. Enable it for bring up and for a CI job, and turn it off once
+		the port is trusted on a board.
+
+		Every case but the in bounds one is expected to report and to
+		assert. That is the pass condition. Do not enable this on a product
+		image.
+
+		The test app in apps/system/kasan_test drives it.
+
 config MM_KASAN_DISABLE_NULL_POINTER_CHECK
 	bool "Do not check for NULL pointer access"
 	default n
