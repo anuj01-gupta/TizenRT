@@ -24,6 +24,14 @@ ifeq ($(CONFIG_MEM_LEAK_CHECKER),y)
 CSRCS += mem_leak_checker.c
 endif
 
+# Built here rather than under mm/ because mm/ is compiled with
+# -fno-sanitize=kernel-address, so an access made from there is never checked
+# and the deliberate errors would go unreported.
+
+ifeq ($(CONFIG_MM_KASAN_SELFTEST),y)
+CSRCS += kasan_selftest.c
+endif
+
 CSRCS += dbg_termination_info.c
 ifeq ($(CONFIG_DEBUG_MM_WARN),y)
 CSRCS += memdbg.c

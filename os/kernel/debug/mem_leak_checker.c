@@ -28,6 +28,7 @@
 #include <queue.h>
 #include <sys/types.h>
 #include <tinyara/mm/mm.h>
+#include <tinyara/mm/kasan.h>
 #include <tinyara/mm/heap_regioninfo.h>
 #include <arch/chip/memory_region.h>
 #include <tinyara/binfmt/elf.h>
@@ -394,6 +395,17 @@ int run_mem_leak_checker(int checker_pid, char *bin_name)
 	int broken_cnt = 0;
 	struct mm_heap_s *heap = NULL;
 
+	/* The leak checker walks every node in the heap, free ones included, and
+	 * then scans raw RAM. Both read memory that KASan has poisoned on
+	 * purpose: a free chunk, and the header in front of every live chunk.
+	 * This file is outside os/mm and so is instrumented, so checking has to
+	 * be off for the duration or the checker reports its own reads.
+	 *
+	 * Every return below must re-enable it.
+	 */
+
+	kasan_stop();
+
 	if (strncmp(bin_name, "kernel", strlen("kernel") + 1) == 0) {
 		heap = kmm_get_baseheap();
 	} 
@@ -405,22 +417,26 @@ int run_mem_leak_checker(int checker_pid, char *bin_name)
 
 	if (!heap) {
 		printf("Can't found heap, bin name: %s", bin_name);
+		kasan_start();
 		return ERROR;
 	}
 
 	node_cnt = get_node_cnt(heap);
 	if (MAX_ALLOC_COUNT < node_cnt) {
 		printf("Available buffer size (%d) is small.\nPlease increase CONFIG_MEM_LEAK_CHECKER_MAX_ALLOC_COUNT value more than %d.\n", MAX_ALLOC_COUNT, node_cnt);
+		kasan_start();
 		return ERROR;
 	}
 
 	if (g_hash_table || g_node_info) {
 		printf("mem_leak_checker is already running.\n");
+		kasan_start();
 		return ERROR;
 	}
 
 	if (hash_init() != OK) {
 		printf("hash table memory alloc is failed.\n");
+		kasan_start();
 		return ERROR;
 	}
 
@@ -432,6 +448,7 @@ int run_mem_leak_checker(int checker_pid, char *bin_name)
 	print_info(heap, leak_cnt, broken_cnt);
 
 	hash_deinit();
+	kasan_start();
 	return OK;
 }
 

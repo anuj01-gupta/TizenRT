@@ -61,6 +61,7 @@
 #include <unistd.h>
 
 #include <tinyara/mm/mm.h>
+#include <tinyara/mm/kasan.h>
 
 #ifdef CONFIG_DEBUG_MM_HEAPINFO
 #include <tinyara/sched.h>
@@ -189,6 +190,18 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
 	heapinfo_subtract_size(heap, ((struct mm_allocnode_s *)node)->pid, ((struct mm_allocnode_s *)node)->size);
 	heapinfo_update_total_size(heap, ((-1) * ((struct mm_allocnode_s *)node)->size), ((struct mm_allocnode_s *)node)->pid);
 #endif
+	/* Close the chunk off before it is merged into the free list, while
+	 * node->size still describes the allocation that is being released. Any
+	 * later access through the freed pointer is then reported as a
+	 * use-after-free.
+	 *
+	 * This must stay after the delay list early return above. That path
+	 * links the block into the delay list through its own first word, and
+	 * poisoning before it would flag the allocator's own bookkeeping.
+	 */
+
+	kasan_poison(mem, node->size - SIZEOF_MM_ALLOCNODE);
+
 	node->preceding &= ~MM_ALLOC_BIT;
 #ifdef CONFIG_DEBUG_MM_FREEINFO
 	/* Record free metadata and quarantine sequence */

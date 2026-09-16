@@ -68,6 +68,7 @@
 #include  <tinyara/net/net.h>
 #include  <tinyara/lib.h>
 #include  <tinyara/mm/mm.h>
+#include  <tinyara/mm/kasan.h>
 #include  <tinyara/kmalloc.h>
 #include  <tinyara/init.h>
 #include  <tinyara/pm/pm.h>
@@ -423,6 +424,19 @@ static FAR char *g_idleargv[CONFIG_SMP_NCPUS][2];
 void os_start(void)
 {
 	int i;
+
+	/* Hold KASan off until a heap registers a region and a shadow map
+	 * exists to check against. This must be the first statement: everything
+	 * below is instrumented, and a check taken before any region is
+	 * registered would read a shadow map that is not there.
+	 *
+	 * The gate lives in .bss, so on a platform which clears .bss before
+	 * reaching here it is already closed and this call changes nothing.
+	 * It is kept because that ordering is a property of the startup code,
+	 * not something the memory manager can rely on.
+	 */
+
+	kasan_init_early();
 
 	slldbg("Entry\n");
 

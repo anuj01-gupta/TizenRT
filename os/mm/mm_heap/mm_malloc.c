@@ -59,6 +59,7 @@
 #include <debug.h>
 
 #include <tinyara/mm/mm.h>
+#include <tinyara/mm/kasan.h>
 
 #ifdef CONFIG_DEBUG_MM_HEAPINFO
 #include  <tinyara/sched.h>
@@ -147,6 +148,7 @@ FAR void *mm_malloc(FAR struct mm_heap_s *heap, size_t size, mmaddress_t caller_
 {
 	FAR struct mm_freenode_s *node;
 	void *ret = NULL;
+	size_t nodesize = 0;
 	int ndx;
 	bool gc_done = false;
 #ifdef CONFIG_DEBUG_MM_HEAPINFO
@@ -293,9 +295,22 @@ retry_after_gc:
 		heapinfo_update_total_size(heap, allocnode->size, allocnode->pid);
 #endif
 		ret = (void *)((char *)allocnode + SIZEOF_MM_ALLOCNODE);
+		nodesize = allocnode->size;
 	}
 
 	mm_givesemaphore(heap);
+
+	if (ret) {
+		/* Open up the user area of the chunk. The node header in front of
+		 * it stays poisoned, which is what turns a write just below the
+		 * returned pointer into a reported underflow.
+		 *
+		 * Done outside the semaphore: kasan_unpoison() takes a spinlock of
+		 * its own and there is no reason to hold both.
+		 */
+
+		ret = kasan_unpoison(ret, nodesize - SIZEOF_MM_ALLOCNODE);
+	}
 
 	if (!ret && gc_done == false) {
 		mdbg("Allocation failed!!! We dont have enough memory. Try to free dead task stack areas\n");
