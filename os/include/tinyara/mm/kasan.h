@@ -82,10 +82,28 @@ enum kasan_selftest_e {
  * Pre-processor Definitions
  ****************************************************************************/
 
-#ifndef CONFIG_MM_KASAN
+/* The entry points are real in two cases only: a flat build, where there is
+ * one image and one heap, and the kernel pass of a split build, which is the
+ * pass that compiles with __KERNEL__ defined.
+ *
+ * Everywhere else they collapse to nothing. The user pass of a split build
+ * compiles the same memory manager sources, but allocates from a heap that is
+ * never registered, and os/mm/kasan/Make.defs deliberately keeps the runtime
+ * out of libumm. Leaving the call sites as real calls there would put an
+ * undefined reference to kasan_poison into every user image, for a call that
+ * could only ever find no region and return.
+ *
+ * This is the same test mm_initialize.c applies before registering a heap,
+ * written the other way round, so registration and the poison calls agree on
+ * which pass owns KASan.
+ */
 
-/* With KASan disabled every entry point collapses to nothing, so the call
- * sites in the memory manager need no conditional compilation of their own.
+#if !defined(CONFIG_MM_KASAN) || \
+	(!defined(CONFIG_BUILD_FLAT) && !defined(__KERNEL__))
+
+/* With KASan disabled, or in the user pass, every entry point collapses to
+ * nothing, so the call sites in the memory manager need no conditional
+ * compilation of their own.
  *
  * Each stub still consumes its arguments. A call site typically keeps a size
  * in a local just to pass it here, and discarding the argument would leave
@@ -253,5 +271,5 @@ int kasan_selftest(int testcase);
 }
 #endif
 
-#endif							/* CONFIG_MM_KASAN */
+#endif							/* KASan real in this pass */
 #endif							/* __INCLUDE_MM_KASAN_H */

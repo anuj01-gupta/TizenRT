@@ -68,6 +68,7 @@
 #include <assert.h>
 #include <debug.h>
 
+#include <tinyara/sched.h>
 #include <tinyara/mm/kasan.h>
 
 /****************************************************************************
@@ -280,6 +281,33 @@ static void kasan_report(FAR const void *addr, size_t size, bool is_write, FAR v
 
 	kasan_alert("invalid %s of size %zu at address %p\n", is_write ? "write" : "read", size, addr);
 	kasan_alert("detected from %p\n", return_address);
+
+	/* Name the task that hit the error so a report can be attributed
+	 * without a debugger. Safe here: checking is already stopped above.
+	 */
+
+	{
+		FAR struct tcb_s *tcb = sched_self();
+		if (tcb != NULL) {
+			kasan_alert("current task: %s (%d)\n", tcb->name, tcb->pid);
+
+			/* Known exit window: the current task accessing its own
+			 * (freed) stack. TizenRT frees a dying task's stack while
+			 * the task may still execute on it (self-exit and SMP
+			 * cross-CPU kill). Report it but do not PANIC, so the
+			 * system keeps running and TASH stays available.
+			 */
+
+			if (tcb->stack_alloc_ptr != NULL &&
+			    (uintptr_t)addr >= (uintptr_t)tcb->stack_alloc_ptr &&
+			    (uintptr_t)addr < (uintptr_t)tcb->stack_alloc_ptr + tcb->adj_stack_size) {
+				kasan_alert("access within own freed task stack - known exit window, continuing\n");
+				kasan_show_memory(addr, size);
+				kasan_start();
+				return;
+			}
+		}
+	}
 
 	kasan_show_memory(addr, size);
 
