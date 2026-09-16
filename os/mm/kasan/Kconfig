@@ -1,0 +1,151 @@
+#
+# For a description of the syntax of this configuration file,
+# see kconfig-language at https://www.kernel.org/doc/Documentation/kbuild/kconfig-language.txt
+#
+# Derived from Apache NuttX mm/kasan/Kconfig at commit b4aa94d. The software
+# tag, hardware tag and global data options of the original are not offered:
+# the tag modes need ARMv8 top byte ignore or ARMv8.5 MTE, which no TizenRT
+# target provides, and global data checking needs a two pass link and linker
+# script support which is not in place yet.
+#
+
+config MM_KASAN
+	bool "Kernel Address Sanitizer"
+	default n
+	---help---
+		KASan is a compiler assisted tool for detecting memory errors:
+		heap buffer overflow, heap buffer underflow and use after free.
+		Every instrumented load and store is checked against a shadow map
+		maintained by the memory manager, so an error is reported at the
+		instruction which causes it rather than at the next allocator
+		operation.
+
+		The shadow map holds one bit per machine word and is carved out of
+		the tail of each heap region, costing about 3 percent of the RAM it
+		covers. Expect the image to grow by 30 to 50 percent and to run
+		two to three times slower.
+
+		This is a debug and CI option. Never enable it in a production
+		image.
+
+		NOTE: enabling this option alone builds the runtime but does not
+		yet instrument anything. The compiler flags are added per board;
+		see MM_KASAN_INSTRUMENT_ALL.
+
+config MM_KASAN_INSTRUMENT
+	bool
+
+if MM_KASAN
+
+choice
+	prompt "KASan mode"
+	default MM_KASAN_GENERIC
+
+config MM_KASAN_NONE
+	bool "Instrument but do not check"
+	select MM_KASAN_INSTRUMENT
+	---help---
+		Emit and call the instrumentation entry points, but never report.
+		Useful only for measuring what the call overhead alone costs,
+		separately from the shadow lookup.
+
+config MM_KASAN_GENERIC
+	bool "Generic mode"
+	select MM_KASAN_INSTRUMENT
+	---help---
+		Software shadow memory. Requires no hardware support.
+
+endchoice
+
+config MM_KASAN_INSTRUMENT_ALL
+	bool "Instrument the entire image"
+	depends on MM_KASAN_INSTRUMENT
+	default y
+	---help---
+		Add -fsanitize=kernel-address to the flags for the whole image.
+		The memory manager itself is always excluded; see os/mm/kasan/Make.defs.
+
+		If this is disabled, instrumentation must be requested per
+		directory or per file instead.
+
+		Only the kernel is instrumented in a protected build. User space
+		allocates from a heap that is never registered, so instrumenting
+		it would emit a call for every access that then returns having
+		found no region to check.
+
+		NOTE: the board Make.defs must act on this symbol for it to have
+		any effect. A board which does not yet do so builds unchanged.
+
+config MM_KASAN_INSTRUMENT_BOARD
+	bool "Instrument the vendor board support code as well"
+	depends on MM_KASAN_INSTRUMENT_ALL
+	default n
+	---help---
+		Include the vendor board support code, os/board/<board>/src, in
+		instrumentation.
+
+		Off by default. That code is large, so instrumenting it adds a
+		lot to an image that has a fixed partition to fit into, and it is
+		the least likely place for a first bring-up to want coverage.
+		Bring the board up with TizenRT's own code instrumented, confirm a
+		clean boot with no reports, then turn this on to widen.
+
+		Note that the vendor libraries which ship as binaries cannot be
+		instrumented at all whatever this is set to, so some of the board
+		remains invisible either way.
+
+if MM_KASAN_INSTRUMENT
+
+config MM_KASAN_REGIONS
+	int "Number of regions KASan can track"
+	default 8
+	---help---
+		Maximum number of memory regions that can be registered. This must
+		be at least KMM_REGIONS multiplied by KMM_NHEAPS, counting every
+		heap that registers with KASan.
+
+		Registration of a region beyond this limit is refused with a
+		message and that region is left unchecked.
+
+config MM_KASAN_DISABLE_NULL_POINTER_CHECK
+	bool "Do not check for NULL pointer access"
+	default n
+	---help---
+		By default a load or store through a NULL pointer is reported even
+		when it falls outside any registered region. Disable if some driver
+		legitimately maps a page at address zero.
+
+config MM_KASAN_DISABLE_READS_CHECK
+	bool "Do not instrument reads"
+	default n
+	---help---
+		Instrument only writes. Roughly halves the overhead, at the cost of
+		missing out of bounds reads. Most corruption bugs are writes, so
+		this is a reasonable first configuration on a slow target.
+
+config MM_KASAN_DISABLE_WRITES_CHECK
+	bool "Do not instrument writes"
+	default n
+	---help---
+		Instrument only reads. Rarely what you want; see
+		MM_KASAN_DISABLE_READS_CHECK.
+
+config MM_KASAN_DISABLE_READ_PANIC
+	bool "Do not panic on an invalid read"
+	default n
+	---help---
+		Report the error and carry on rather than asserting. The report is
+		less useful because the crash dump is not taken at the faulting
+		instruction, but the system keeps running, which helps when
+		collecting several errors in one boot.
+
+config MM_KASAN_DISABLE_WRITE_PANIC
+	bool "Do not panic on an invalid write"
+	default n
+	---help---
+		As MM_KASAN_DISABLE_READ_PANIC, for writes. Note that execution
+		continues over already corrupted memory, so later failures may be
+		misleading.
+
+endif # MM_KASAN_INSTRUMENT
+endif # MM_KASAN

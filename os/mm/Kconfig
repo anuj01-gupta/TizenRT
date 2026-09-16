@@ -156,3 +156,5 @@ config MM_LARGE_ALLOC_THRESHOLD
 		to this value are placed at the back of the selected free
 		chunk. Default is 512KB. Must be larger than SIZEOF_MM_FREENODE.
 
+
+source mm/kasan/Kconfig

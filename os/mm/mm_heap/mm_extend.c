@@ -107,6 +107,20 @@ void mm_extend(FAR struct mm_heap_s *heap, FAR void *mem, size_t size, int regio
 
 	DEBUGASSERT(mm_takesemaphore(heap));
 
+	/* NOTE: mm_extend() is not compatible with CONFIG_MM_KASAN.
+	 *
+	 * kasan_register() carves the shadow map for a region out of the tail of
+	 * that region, so the memory immediately above mm_heapend[] is the
+	 * shadow rather than free space. Extending the heap into it would
+	 * overwrite the shadow, and memory added beyond the registered end has
+	 * no shadow to describe it and would silently go unchecked.
+	 *
+	 * This is not reachable in any configuration TizenRT builds today:
+	 * mm_sbrk() is the only in-tree caller and is CONFIG_BUILD_KERNEL only,
+	 * while kmm_extend()/umm_extend() have no callers. Anyone wiring one up
+	 * alongside KASan has to grow the shadow here first.
+	 */
+
 	/* Get the terminal node in the old heap.  The block to extend must
 	 * immediately follow this node.
 	 */

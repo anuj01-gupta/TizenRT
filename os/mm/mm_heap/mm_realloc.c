@@ -64,6 +64,7 @@
 #include <tinyara/sched.h>
 #endif
 #include <tinyara/mm/mm.h>
+#include <tinyara/mm/kasan.h>
 #include "mm_node.h"
 
 /****************************************************************************
@@ -110,6 +111,7 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size, 
 #endif
 	size_t newsize;
 	size_t oldsize;
+	size_t nodesize = 0;
 #ifndef CONFIG_REALLOC_DISABLE_NEIGHBOR_EXTENSION
 	size_t prevsize = 0;
 	size_t nextsize = 0;
@@ -159,6 +161,15 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size, 
 #endif
 
 			mm_shrinkchunk(heap, oldnode, newsize);
+
+			/* Close off whatever the shrink handed back to the free list.
+			 * That tail was part of the live allocation and so was open;
+			 * mm_shrinkchunk() may keep it if the remainder is too small to
+			 * split, in which case oldnode->size is unchanged and this
+			 * poisons nothing.
+			 */
+
+			kasan_poison((FAR char *)oldnode + oldnode->size, oldsize - oldnode->size);
 #ifdef CONFIG_DEBUG_MM_HEAPINFO
 			/* update the chunk to realloc task information */
 			heapinfo_update_node(oldnode, caller_retaddr);
@@ -300,6 +311,16 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size, 
 			 */
 
 			newmem = (FAR void *)((FAR char *)newnode + SIZEOF_MM_ALLOCNODE);
+
+			/* Open the grown chunk up before the copy, not after. The chunk
+			 * now covers memory that was free, and therefore poisoned, and
+			 * memcpy() lives in lib/libc which is instrumented. Copying into
+			 * still poisoned memory would be reported as a genuine looking
+			 * use-after-free coming from inside realloc.
+			 */
+
+			newmem = kasan_unpoison(newmem, oldsize - SIZEOF_MM_ALLOCNODE);
+
 			memcpy(newmem, oldmem, oldsize - SIZEOF_MM_ALLOCNODE);
 		}
 
@@ -352,7 +373,21 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size, 
 		heapinfo_update_total_size(heap, oldnode->size, oldnode->pid);
 #endif
 
+		/* Read the final size while the heap is still locked; another CPU
+		 * may take the semaphore the moment it is released.
+		 */
+
+		nodesize = oldnode->size;
+
 		mm_givesemaphore(heap);
+
+		/* Open up the whole grown chunk. This covers the extension into the
+		 * next node, which needs no copy and so is not handled above, and is
+		 * harmlessly repeated for the previous node case.
+		 */
+
+		newmem = kasan_unpoison(newmem, nodesize - SIZEOF_MM_ALLOCNODE);
+
 		return newmem;
 	}
 

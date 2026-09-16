@@ -51,6 +51,18 @@
 
 -include $(TOPDIR)/Make.defs
 
+# The vendor board support code is left out of KASan instrumentation unless
+# it is asked for. It is large, and the kernel image has a fixed partition to
+# fit into, so a first bring-up covers TizenRT's own code and widens later.
+# See CONFIG_MM_KASAN_INSTRUMENT_BOARD.
+
+ifeq ($(CONFIG_MM_KASAN),y)
+ifneq ($(CONFIG_MM_KASAN_INSTRUMENT_BOARD),y)
+CFLAGS += -fno-sanitize=kernel-address
+CXXFLAGS += -fno-sanitize=kernel-address
+endif
+endif
+
 DEPPATH = --dep-path .
 VPATH = .
 ASRCS =
