@@ -82,7 +82,7 @@ static volatile uint32_t g_tlb_flush_done;  /* ACK flag: Core 1 sets after TLB f
  * If they match, returns mmu_l1_pgtable() (no change).
  * If they differ, prints warning and returns TTBR0-based address.
  */
-static inline uint32_t *mmu_l1_pgtable_safe(void)
+uint32_t *mmu_l1_pgtable_safe(void)
 {
 	uint32_t *pgtable = mmu_l1_pgtable();
 	uint32_t raw_ttbr0;
@@ -534,6 +534,14 @@ uint32_t *mmu_allocate_app_l1_pgtbl(int app_id)
  ****************************************************************************/
 uint32_t *mmu_allocate_app_l2_pgtbl(int app_id, int l2idx)
 {
+	/* === DIAGNOSTIC LOGS START === */
+	lldbg("L2_ALLOC: >>> ENTER <<< app_id=%d l2idx=%d\n", app_id, l2idx);
+	lldbg("L2_ALLOC: CONFIG_NUM_L2_PER_APP = %d\n", CONFIG_NUM_L2_PER_APP);
+	lldbg("L2_ALLOC: PGTABLE_BASE_VADDR = 0x%08X\n", PGTABLE_BASE_VADDR);
+	lldbg("L2_ALLOC: L1_PGTBL_SIZE = %d bytes\n", L1_PGTBL_SIZE);
+	lldbg("L2_ALLOC: L2_PGTBL_SIZE = %d bytes\n", L2_PGTBL_SIZE);
+	/* === DIAGNOSTIC LOGS END === */
+
 	dbg("app_id : %d, l2idx : %d\n", app_id, l2idx);
 	/* Page table structure as follows:
 	 *
@@ -544,6 +552,14 @@ uint32_t *mmu_allocate_app_l2_pgtbl(int app_id, int l2idx)
 	 */
 	uint32_t *addr = (uint32_t *)(PGTABLE_BASE_VADDR + ((CONFIG_NUM_APPS + 1) * L1_PGTBL_SIZE) + 
 			((CONFIG_NUM_APPS - app_id) * CONFIG_NUM_L2_PER_APP * L2_PGTBL_SIZE) + (l2idx * L2_PGTBL_SIZE));
+
+	/* === DIAGNOSTIC LOGS START === */
+	lldbg("L2_ALLOC: Calculated addr = 0x%08X\n", (uint32_t)addr);
+	lldbg("L2_ALLOC: L2 table range: 0x%08X - 0x%08X\n", 
+	      (uint32_t)addr, (uint32_t)addr + L2_PGTBL_SIZE - 1);
+	lldbg("L2_ALLOC: <<< EXIT >>>\n");
+	/* === DIAGNOSTIC LOGS END === */
+
 	return addr;
 }
 
@@ -773,11 +789,9 @@ void mmu_split_section_to_l2(uint32_t vaddr)
 	uint32_t *l2table;
 	int i;
 
-
-
-	lldbg("SPLIT: vaddr=0x%08x section=0x%08x l1_entry=0x%08x\n",
+	lldbg("SPLIT_RUNTIME: vaddr=0x%08x section=0x%08x l1_entry=0x%08x\n",
 	      vaddr, section_addr, l1_entry);
-	lldbg("SPLIT: s_l2_table at 0x%08x\n", (uint32_t)s_l2_table);
+	lldbg("SPLIT_RUNTIME: s_l2_table at 0x%08x\n", (uint32_t)s_l2_table);
 
 	/* Only split if currently mapped as a 1MB section */
 	if ((l1_entry & PMD_TYPE_MASK) != PMD_TYPE_SECT) {
@@ -955,7 +969,6 @@ void mmu_split_section_to_l2(uint32_t vaddr)
 	cp15_invalidate_tlbs();
 	ARM_ISB();
 }
-
 #endif
 
 

@@ -31,6 +31,21 @@
 #include <tinyara/sched.h>
 #include <tinyara/irq.h>
 #include <tinyara/mmu.h>
+#ifdef CONFIG_MMU_PAGE_PROTECT
+#include <tinyara/arch.h>
+/* External function to get page table base */
+extern uint32_t *mmu_get_os_l1_pgtbl(void);
+#define PGTABLE_BASE_VADDR  ((uint32_t)mmu_get_os_l1_pgtbl())
+/* External function to get L1 page table (matches mmu_split_section_to_l2) */
+extern uint32_t *mmu_l1_pgtable_safe(void);
+/* MMU Page Table Entry macros - copied from arch/arm/src/armv7-a/mmu.h */
+
+#define PMD_TYPE_SHIFT         (0)
+#define PMD_TYPE_MASK          (3 << PMD_TYPE_SHIFT)
+#define PMD_TYPE_SECT          (2 << PMD_TYPE_SHIFT)  /* 1MB section */
+#define PMD_TYPE_PTE           (1 << PMD_TYPE_SHIFT)  /* L2 page table */
+#define PMD_PTE_PADDR_MASK     (0xFFFFFC00)           /* L2 table address mask */
+#endif
 #include "os_api_test_proto.h"
 #include "wdog/wdog.h"
 
@@ -39,7 +54,6 @@
 #include <tinyara/mem_protect_test.h>
 #include "binary_manager/binary_manager_internal.h"
 #endif
-
 /****************************************************************************
  * Public variables
  ****************************************************************************/
@@ -470,6 +484,179 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		break;
 	}
 
+#ifdef CONFIG_MMU_PAGE_PROTECT
+	/* TC-AL-R1: Section split correctness - Verify all 256 L2 entries (Safe) */
+	case TESTIOC_AL_R1_SPLIT_CORRECTNESS: {
+		uint8_t *buf;
+		uint32_t page_addr;
+		uint32_t original_l1;
+		uint32_t new_l1;
+		uint32_t *l1table;
+		uint32_t *l2table;
+		int pass_count = 0;
+		int fail_count = 0;
+		int i;
+
+		lldbg("=== R1 Unit Test: Split Correctness ===\n");
+
+		/* Allocate aligned page */
+		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
+		if (!buf) {
+			lldbg("R1: kmm_memalign failed\n");
+			return -ENOMEM;
+		}
+		page_addr = ((uint32_t)buf + 4095) & ~4095u;
+
+		lldbg("R1: Test address = 0x%08X\n", page_addr);
+
+		/* Get L1 table - use SAME table as mmu_split_section_to_l2() */
+		l1table = mmu_l1_pgtable_safe();
+		uint32_t l1_index = page_addr >> 20;
+
+		/* Step 1: Read original L1 entry */
+		original_l1 = l1table[l1_index];
+		lldbg("R1: Original L1[%d] = 0x%08X (type=0x%x)\n",
+			   l1_index, original_l1, original_l1 & PMD_TYPE_MASK);
+
+		/* Step 2: If already split (PTE), restore to section first */
+		if ((original_l1 & PMD_TYPE_MASK) == PMD_TYPE_PTE) {
+			lldbg("R1: Memory already split (PTE), restoring to section...\n");
+			
+			/* Calculate section base address */
+			uint32_t sect_addr = page_addr & 0xFFE00000;
+			
+			/* Read L2 table to get original attributes */
+			uint32_t *l2table_temp = (uint32_t *)(original_l1 & PMD_PTE_PADDR_MASK);
+			uint32_t l2_entry = l2table_temp[0];
+			
+			/* Reconstruct L1 section entry from L2 attributes */
+			uint32_t sect_entry = sect_addr;
+			sect_entry |= PMD_TYPE_SECT;
+			sect_entry |= ((l2_entry >> 4) & 0x3) << 10;    /* AP[1:0] */
+			sect_entry |= ((l2_entry >> 9) & 0x1) << 15;    /* APX */
+			sect_entry |= ((l2_entry >> 6) & 0x7) << 12;    /* TEX[2:0] */
+			sect_entry |= ((l2_entry >> 3) & 0x1) << 3;     /* C */
+			sect_entry |= ((l2_entry >> 2) & 0x1) << 2;     /* B */
+			sect_entry |= ((l2_entry >> 0) & 0x1) << 4;     /* XN */
+			sect_entry |= (1 << 16);                         /* S */
+			
+			/* Restore to section */
+			l1table[l1_index] = sect_entry;
+			
+			/* Flush TLB */
+			__asm__ volatile("mcr p15, 0, %0, c8, c7, 0" :: "r"(0));
+			__asm__ volatile("dsb sy");
+			__asm__ volatile("isb");
+			
+			lldbg("R1: Restored to section 0x%08X\n", sect_entry);
+			
+			/* Update original_l1 for comparison later */
+			original_l1 = sect_entry;
+			lldbg("R1: Now splitting fresh for this TC\n");
+		}
+		else if ((original_l1 & PMD_TYPE_MASK) != PMD_TYPE_SECT) {
+			lldbg("R1: ERROR - Unknown L1 type 0x%x!\n", original_l1 & PMD_TYPE_MASK);
+			kmm_free(buf);
+			return -EINVAL;
+		}
+		else {
+			lldbg("R1: Fresh section found, splitting for this TC\n");
+		}
+
+		/* Step 3: Now split fresh (whether restored or was already section) */
+		lldbg("R1: Calling mmu_split_section_to_l2(0x%08X)...\n", page_addr);
+		mmu_split_section_to_l2(page_addr);
+
+		/* Step 4: Verify new L1 entry */
+		new_l1 = l1table[l1_index];
+		lldbg("R1: New L1[%d] = 0x%08X (type=0x%x)\n",
+			   l1_index, new_l1, new_l1 & PMD_TYPE_MASK);
+
+		if ((new_l1 & PMD_TYPE_MASK) != PMD_TYPE_PTE) {
+			lldbg("R1: FAIL - L1 entry type is not Page Table (expected 0x10, got 0x%x)\n",
+				   new_l1 & PMD_TYPE_MASK);
+			kmm_free(buf);
+			return -EINVAL;
+		}
+		lldbg("R1: PASS - L1 entry type is Page Table (0x10)\n");
+		pass_count++;
+
+		/* Get L2 table address */
+		l2table = (uint32_t *)(new_l1 & PMD_PTE_PADDR_MASK);
+		lldbg("R1: L2 table at 0x%08X\n", l2table);
+
+		/* Step 5: Verify all 256 L2 entries match original L1 attributes */
+		lldbg("R1: Verifying 256 L2 entries...\n");
+
+		/* Extract original L1 attributes */
+		uint32_t original_ap = (original_l1 >> 10) & 0x3;      /* AP[1:0] at bits 10-11 */
+		uint32_t original_apx = (original_l1 >> 15) & 0x1;     /* APX at bit 15 */
+		uint32_t original_tex = (original_l1 >> 12) & 0x7;     /* TEX at bits 12-14 */
+		uint32_t original_c = (original_l1 >> 3) & 0x1;        /* C at bit 3 */
+		uint32_t original_b = (original_l1 >> 2) & 0x1;        /* B at bit 2 */
+
+		for (i = 0; i < 256; i++) {
+			uint32_t l2_entry = l2table[i];  /* Read L2 entry */
+			uint32_t l2_ap = (l2_entry >> 4) & 0x3;            /* AP[1:0] at bits 4-5 */
+			uint32_t l2_apx = (l2_entry >> 9) & 0x1;           /* APX at bit 9 */
+			uint32_t l2_tex = (l2_entry >> 6) & 0x7;           /* TEX at bits 6-8 */
+			uint32_t l2_c = (l2_entry >> 3) & 0x1;             /* C at bit 3 */
+			uint32_t l2_b = (l2_entry >> 2) & 0x1;             /* B at bit 2 */
+
+			/* Compare permissions, TEX, C, B bits */
+			if (l2_ap == original_ap &&
+				l2_apx == original_apx &&
+				l2_tex == original_tex &&
+				l2_c == original_c &&
+				l2_b == original_b) {
+				pass_count++;
+			} else {
+				fail_count++;
+				if (fail_count <= 5) {  /* Print first 5 failures */
+					lldbg("  FAIL L2[%d]: entry=0x%08X\n", i, l2_entry);
+					lldbg("    AP:   exp 0x%x, got 0x%x\n", original_ap, l2_ap);
+					lldbg("    APX:  exp %d, got %d\n", original_apx, l2_apx);
+					lldbg("    TEX:  exp %d, got %d\n", original_tex, l2_tex);
+					lldbg("    C:    exp %d, got %d\n", original_c, l2_c);
+					lldbg("    B:    exp %d, got %d\n", original_b, l2_b);
+				}
+			}
+		}
+
+		/* Step 6: Verify memory is still accessible */
+		lldbg("R1: Testing memory accessibility...\n");
+		volatile uint8_t *test_ptr = (volatile uint8_t *)page_addr;
+		uint8_t original_value = test_ptr[0];
+		test_ptr[0] = 0xAA;
+		uint8_t read_value = test_ptr[0];
+		test_ptr[0] = original_value;  /* Restore */
+
+		if (read_value != 0xAA) {
+			lldbg("R1: FAIL - Memory write/read test failed!\n");
+			kmm_free(buf);
+			return -EINVAL;
+		}
+		lldbg("R1: PASS - Memory is accessible after split\n");
+		pass_count++;
+
+		/* Final Result */
+		lldbg("\n=== R1 Test Result ===\n");
+		lldbg("L2 entries passed: %d/256\n", pass_count - 2);
+		lldbg("L2 entries failed: %d/256\n", fail_count);
+		lldbg("L1 type test:      PASS\n");
+		lldbg("Memory test:       PASS\n");
+
+		if (fail_count == 0) {
+			lldbg("\n*** R1 UNIT TEST PASSED: All 256 L2 entries verified ***\n");
+			ret = OK;
+		} else {
+			lldbg("\n*** R1 UNIT TEST FAILED: %d L2 entries mismatch ***\n", fail_count);
+			ret = -EINVAL;
+		}
+
+		kmm_free(buf);
+		break;
+	}
 	/* TC-AL-01: Section split verification (Safe) */
 	case TESTIOC_AL_SPLIT: {
 		uint8_t *buf;
@@ -626,7 +813,9 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = -EIO;
 		break;
 	}
+#endif
 
+#ifdef CONFIG_MMU_PAGE_PROTECT
 	/* TC-AL-05: Split + 4KB-granular protect (Fatal, single-core) */
 	case TESTIOC_AL_SPLIT_PROTECT: {
 		uint8_t *buf;
@@ -686,8 +875,11 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = -EIO;
 		break;
 	}
+#endif /* CONFIG_MMU_PAGE_PROTECT */
+#endif
 
 #ifdef CONFIG_SMP
+#ifdef CONFIG_MMU_PAGE_PROTECT
 	/* TC-AL-06: SMP cross-core no-access (Fatal)
 	 *
 	 * Two-phase test to properly reproduce the SMP TLB defect:
@@ -938,6 +1130,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		break;
 	}
 #endif /* CONFIG_SMP */
+#endif /* CONFIG_MMU_PAGE_PROTECT */
 
 	/* TC-AL-08: Page protect + restore round-trip (Safe, single-core) */
 	case TESTIOC_AL_SMP_RESTORE: {
@@ -967,6 +1160,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 	}
 
 	/* TC-AL-09: Section split (Safe, single-core) */
+#ifdef CONFIG_MMU_PAGE_PROTECT
 	case TESTIOC_AL_SMP_SPLIT: {
 		uint8_t *buf;
 		uint32_t page_addr;
@@ -988,7 +1182,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = OK;
 		break;
 	}
-#endif /* CONFIG_EXAMPLES_MMU_PROTECT_TEST && CONFIG_MMU_PAGE_PROTECT */
+#endif /* CONFIG_MMU_PAGE_PROTECT */
 
 #ifdef CONFIG_EXAMPLES_MMU_PROTECT_TEST
 	case TESTIOC_WDOG_MMU_PROTECT_TEST: {
@@ -1063,7 +1257,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 
 #ifdef CONFIG_WDOG_MMU_DEFECT_TEST
 
-#ifdef CONFIG_WDOG_MMU_DEFECT_TEST_SMP
 	case TESTIOC_WDOG_DEFECT_SMP: {
 		/* Defect #1: SMP DACR per-core issue.
 		 *
@@ -1128,9 +1321,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = OK;
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_DEFECT_TEST_SMP */
 
-#ifdef CONFIG_WDOG_MMU_DEFECT_TEST_DSB
 	case TESTIOC_WDOG_DEFECT_DSB: {
 		/* Defect #3: Missing dsb after DACR write.
 		 *
@@ -1167,9 +1358,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = OK;
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_DEFECT_TEST_DSB */
 
-#ifdef CONFIG_WDOG_MMU_DEFECT_TEST_DACR_CLOBBER
 	case TESTIOC_WDOG_DEFECT_DACR_CLOBBER: {
 		/* Defect #7: DACR clobbers other domains.
 		 *
@@ -1218,9 +1407,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = OK;
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_DEFECT_TEST_DACR_CLOBBER */
 
-#ifdef CONFIG_WDOG_MMU_DEFECT_TEST_HEAP_OVERLAP
 	case TESTIOC_WDOG_DEFECT_HEAP_OVERLAP: {
 		/* Defect #8: Heap overlap with wdog pool.
 		 *
@@ -1265,9 +1452,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = OK;
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_DEFECT_TEST_HEAP_OVERLAP */
 
-#ifdef CONFIG_WDOG_MMU_DEFECT_TEST_WD_RECOVER
 	case TESTIOC_WDOG_DEFECT_WD_RECOVER: {
 		/* Defect #11: wd_recover() missing protection.
 		 *
@@ -1325,9 +1510,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = OK;
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_DEFECT_TEST_WD_RECOVER */
 
-#ifdef CONFIG_WDOG_MMU_DEFECT_TEST_ABORT_HANDLER
 	case TESTIOC_WDOG_DEFECT_ABORT_HANDLER: {
 		/* Defect #12: Data Abort handler guard.
 		 *
@@ -1354,9 +1537,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = OK;
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_DEFECT_TEST_ABORT_HANDLER */
 
-#ifdef CONFIG_WDOG_MMU_DEFECT_TEST_BOOT_ORDER
 	case TESTIOC_WDOG_DEFECT_BOOT_ORDER: {
 		/* Defect #13: Boot order issue.
 		 *
@@ -1385,9 +1566,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = OK;
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_DEFECT_TEST_BOOT_ORDER */
 
-#ifdef CONFIG_WDOG_MMU_DEFECT_TEST_SECTION_SIZE
 	case TESTIOC_WDOG_DEFECT_SECTION_SIZE: {
 		/* Defect #15: L1 entry cache coherency.
 		 *
@@ -1427,13 +1606,11 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = OK;
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_DEFECT_TEST_SECTION_SIZE */
 
 #endif /* CONFIG_WDOG_MMU_DEFECT_TEST */
 
 #ifdef CONFIG_WDOG_MMU_SCENARIO_TEST
 
-#ifdef CONFIG_WDOG_MMU_SCENARIO_TEST_NORMAL_OP
 	case TESTIOC_WDOG_SCENARIO_NORMAL_OP: {
 		/* TC-05: Normal wdog operation (start/cancel 100x).
 		 *
@@ -1482,9 +1659,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = (ok_count == 100) ? OK : -EIO;
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_SCENARIO_TEST_NORMAL_OP */
 
-#ifdef CONFIG_WDOG_MMU_SCENARIO_TEST_MULTI_EXPIRE
 	case TESTIOC_WDOG_SCENARIO_MULTI_EXPIRE: {
 		/* TC-06: Multiple watchdog expiration in same tick.
 		 *
@@ -1550,9 +1725,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		}
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_SCENARIO_TEST_MULTI_EXPIRE */
 
-#ifdef CONFIG_WDOG_MMU_SCENARIO_TEST_SMP_CONCURRENT
 	case TESTIOC_WDOG_SCENARIO_SMP_CONCURRENT: {
 		/* TC-08: SMP concurrent wdog access from multiple cores.
 		 *
@@ -1684,9 +1857,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 #endif /* CONFIG_SMP */
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_SCENARIO_TEST_SMP_CONCURRENT */
 
-#ifdef CONFIG_WDOG_MMU_SCENARIO_TEST_SMP_TICK_CB
 	case TESTIOC_WDOG_SCENARIO_SMP_TICK_CB: {
 		/* TC-09: SMP timer tick on Core 0, callback on Core 1.
 		 *
@@ -1788,9 +1959,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		}
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_SCENARIO_TEST_SMP_TICK_CB */
 
-#ifdef CONFIG_WDOG_MMU_SCENARIO_TEST_NESTING_STRESS
 	case TESTIOC_WDOG_SCENARIO_NESTING_STRESS: {
 		/* TC-13: Nesting counter stress test (1000 reentrant calls).
 		 *
@@ -1830,9 +1999,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		ret = OK;
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_SCENARIO_TEST_NESTING_STRESS */
 
-#ifdef CONFIG_WDOG_MMU_SCENARIO_TEST_LONG_RUN
 	case TESTIOC_WDOG_SCENARIO_LONG_RUN: {
 		/* TC-15: Long-run stability test.
 		 *
@@ -1892,7 +2059,6 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		}
 		break;
 	}
-#endif /* CONFIG_WDOG_MMU_SCENARIO_TEST_LONG_RUN */
 
 #endif /* CONFIG_WDOG_MMU_SCENARIO_TEST */
 

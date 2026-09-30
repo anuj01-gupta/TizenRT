@@ -71,7 +71,7 @@
 #define TESTIOC_WDOG_MMU_PROTECT_TEST _TESTIOC(27)
 #endif
 
-#ifdef CONFIG_WDOG_MMU_DEFECT_TEST
+#ifdef CONFIG_WDOG_MMU_SCENARIO_TEST
 #ifndef _TESTIOC
 #define _TESTIOC(nr)               _IOC(_TESTIOCBASE, nr)
 #endif
@@ -86,7 +86,7 @@
 #define TESTIOC_WDOG_DEFECT_ABORT_HANDLER   _TESTIOC(33)
 #define TESTIOC_WDOG_DEFECT_BOOT_ORDER      _TESTIOC(34)
 #define TESTIOC_WDOG_DEFECT_SECTION_SIZE    _TESTIOC(35)
-#endif /* CONFIG_WDOG_MMU_DEFECT_TEST */
+#endif /* CONFIG_WDOG_MMU_SCENARIO_TEST */
 
 #ifdef CONFIG_WDOG_MMU_SCENARIO_TEST
 #ifndef _TESTIOC
@@ -119,6 +119,7 @@
 #define TESTIOC_AL_SMP_RO             _TESTIOC(48)
 #define TESTIOC_AL_SMP_RESTORE        _TESTIOC(49)
 #define TESTIOC_AL_SMP_SPLIT          _TESTIOC(50)
+#define TESTIOC_AL_R1_SPLIT_CORRECTNESS _TESTIOC(51)
 #endif /* CONFIG_MMU_PAGE_PROTECT */
 
 /* ioctl arg values: 0 = read test, 1 = write test */
@@ -150,9 +151,9 @@ static void mmu_protect_test_usage(void)
 	printf("  wdog_write — Write to wdog protected page from outside wdog code\n");
 	printf("               If CONFIG_WDOG_MMU_PROTECT=y → Data Abort (crash)\n");
 	printf("               If CONFIG_WDOG_MMU_PROTECT=n → write succeeds (no crash)\n");
-#ifdef CONFIG_WDOG_MMU_DEFECT_TEST
+#ifdef CONFIG_WDOG_MMU_SCENARIO_TEST
 	printf("\n");
-	printf("Defect Reproduction Tests (requires CONFIG_WDOG_MMU_DEFECT_TEST):\n");
+	printf("Defect Reproduction Tests (requires CONFIG_WDOG_MMU_SCENARIO_TEST):\n");
 	printf("  defect_smp            — Defect #1: SMP DACR per-core issue\n");
 	printf("  defect_dsb            — Defect #3: Missing dsb after DACR write\n");
 	printf("  defect_dacr_clobber   — Defect #7: DACR clobbers other domains\n");
@@ -177,6 +178,7 @@ static void mmu_protect_test_usage(void)
 	printf("\n");
 	printf("AL Layer Tests (requires CONFIG_MMU_PAGE_PROTECT):\n");
 	printf("  al_split              - TC-AL-01: Section split (safe)\n");
+	printf("  al_r1_split           - TC-AL-R1: Split correctness - 256 L2 entries (safe)\n");
 	printf("  al_noaccess_restore   - TC-AL-02: No-access + restore (safe)\n");
 	printf("  al_ro_restore         - TC-AL-03: RO + restore (safe)\n");
 	printf("  al_noaccess_abort     - TC-AL-04: No-access -> Data Abort (fatal)\n");
@@ -315,7 +317,7 @@ int mmu_protect_test_main(int argc, char *argv[])
 		close(fd);
 		return ret;
 	}
-#ifdef CONFIG_WDOG_MMU_DEFECT_TEST
+#ifdef CONFIG_WDOG_MMU_SCENARIO_TEST
 	else if (strcmp(argv[1], "defect_smp") == 0 ||
 	         strcmp(argv[1], "defect_dsb") == 0 ||
 	         strcmp(argv[1], "defect_dacr_clobber") == 0 ||
@@ -370,8 +372,6 @@ int mmu_protect_test_main(int argc, char *argv[])
 		close(fd);
 		return ret;
 	}
-#endif /* CONFIG_WDOG_MMU_DEFECT_TEST */
-#ifdef CONFIG_WDOG_MMU_SCENARIO_TEST
 	else if (strcmp(argv[1], "scenario_normal") == 0 ||
 	         strcmp(argv[1], "scenario_multi_expire") == 0 ||
 	         strcmp(argv[1], "scenario_smp_concurrent") == 0 ||
@@ -432,7 +432,8 @@ int mmu_protect_test_main(int argc, char *argv[])
 	}
 #endif /* CONFIG_WDOG_MMU_SCENARIO_TEST */
 #ifdef CONFIG_MMU_PAGE_PROTECT
-	else if (strcmp(argv[1], "al_split") == 0 ||
+	else if (strcmp(argv[1], "al_r1_split") == 0 ||
+	         strcmp(argv[1], "al_split") == 0 ||
 	         strcmp(argv[1], "al_noaccess_restore") == 0 ||
 	         strcmp(argv[1], "al_ro_restore") == 0 ||
 	         strcmp(argv[1], "al_noaccess_abort") == 0 ||
@@ -447,7 +448,9 @@ int mmu_protect_test_main(int argc, char *argv[])
 
 		int al_cmd;
 
-		if (strcmp(argv[1], "al_split") == 0) {
+		if (strcmp(argv[1], "al_r1_split") == 0) {
+			al_cmd = TESTIOC_AL_R1_SPLIT_CORRECTNESS;
+		} else if (strcmp(argv[1], "al_split") == 0) {
 			al_cmd = TESTIOC_AL_SPLIT;
 		} else if (strcmp(argv[1], "al_noaccess_restore") == 0) {
 			al_cmd = TESTIOC_AL_NOACCESS_RESTORE;
@@ -485,7 +488,11 @@ int mmu_protect_test_main(int argc, char *argv[])
 			return ERROR;
 		}
 
-		printf("[mmu_protect_test] Running AL test, check debug log (lldbg)\n");
+		if (strcmp(argv[1], "al_r1_split") == 0) {
+			printf("[mmu_protect_test] Running R1 split correctness test (256 L2 entries)\n");
+		} else {
+			printf("[mmu_protect_test] Running AL test, check debug log (lldbg)\n");
+		}
 
 		ret = ioctl(fd, al_cmd, 0);
 

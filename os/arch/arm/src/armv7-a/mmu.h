@@ -1664,9 +1664,26 @@ void mmu_invalidate_region(uint32_t vstart, size_t size);
  *   vaddr - A virtual address within the page whose PTE should be saved.
  *
  ****************************************************************************/
-
 #ifdef CONFIG_MMU_PAGE_PROTECT
+uint32_t *mmu_l1_pgtable_safe(void);
 uint32_t mmu_save_page_pte(uint32_t vaddr);
+#endif
+
+/****************************************************************************
+ * Name: mmu_split_section_boot
+ *
+ * Description:
+ *   Split a 1MB section into 256x4KB pages at BOOT TIME.
+ *   Called once during initialization with pre-allocated L2 table.
+ *
+ * Input Parameters:
+ *   vaddr   - Virtual address within the 1MB section to split
+ *   l2table - Pre-allocated L2 table address (from reserved pool)
+ *
+ ****************************************************************************/
+
+#ifndef CONFIG_ARCH_ROMPGTABLE
+void mmu_split_section_to_l2(uint32_t vaddr);
 #endif
 
 /****************************************************************************

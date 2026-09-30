@@ -144,4 +144,47 @@ void mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte);
 
 #endif /* CONFIG_MMU_PAGE_PROTECT */
 
+/****************************************************************************
+ * ARM CP15 and Performance Counter Inline Functions
+ *
+ * These are static inline to avoid linker conflicts when included from
+ * multiple .c files (kernel and drivers).
+ ****************************************************************************/
+
+/* NOTE: cp15_clean_dcache_bymva is defined in arch/arm/src/armv7-a/cp15_cacheops.h for arch code */
+
+/* For kernel/drivers that can't include arch headers, provide __cp15_clean_dcache_bymva__ */
+static inline void __cp15_clean_dcache_bymva__(uint32_t va)
+{
+	__asm__ __volatile__(
+		"mcr p15, 0, %0, c7, c10, 1"  /* DCCMVAC */
+		:
+		: "r" (va)
+		: "memory"
+	);
+}
+
+#ifndef __ASM_ARM_BARRIERS_H
+#define ARM_DSB() __asm__ __volatile__("dsb sy" ::: "memory")
+#define ARM_ISB() __asm__ __volatile__("isb" ::: "memory")
+#else
+/* Use arch definitions if available */
+#define ARM_DSB() dsb_sy()
+#define ARM_ISB() isb()
+#endif
+
+#ifndef _TINYARA_CLOCK_H
+static inline uint32_t up_get_cycle_count(void)
+{
+	uint32_t cycles;
+	__asm__ __volatile__(
+		"mrc p15, 0, %0, c9, c13, 0"  /* Read PMCCNTR */
+		: "=r" (cycles)
+		:
+		: "memory"
+	);
+	return cycles;
+}
+#endif
+
 #endif
