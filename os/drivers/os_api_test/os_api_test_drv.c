@@ -1184,6 +1184,49 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 	}
 #endif /* CONFIG_MMU_PAGE_PROTECT */
 
+/* TC-R2: Fault report verification - register, protect, corrupt (FATAL) */
+#if defined(CONFIG_MMU_PAGE_PROTECT) && defined(CONFIG_MMU_FAULT_REPORT)
+	case TESTIOC_MMU_REGION_REPORT: {
+		static uint8_t r2_page[4096] __attribute__((aligned(4096)));
+		uint32_t saved_pte;
+
+		/* Step 1: Register the region by name in the fault report
+		 * registry so the report can name it when the abort fires.
+		 */
+		if (mmu_protect_region_register("r2_test_page",
+						(uintptr_t)r2_page,
+						sizeof(r2_page)) < 0) {
+			lldbg("R2: mmu_protect_region_register failed\n");
+			return -ENOMEM;
+		}
+
+		/* Step 2: Split the 1MB section containing r2_page into 4KB
+		 * pages.  r2_page (kernel .bss, 0x60124000) shares its section
+		 * with kernel .data/.bss (exception stacks, TCBs, and the
+		 * g_mmu_regions registry itself).  Protecting at section
+		 * granularity would make the abort handler's own data
+		 * inaccessible -> unrecoverable nested abort (system hang,
+		 * as measured on rtl8730e).  Splitting limits the no-access
+		 * region to the single r2_page.
+		 */
+		mmu_split_section_to_l2((uint32_t)r2_page);
+
+		/* Step 3: Protect the page (no access) */
+		saved_pte = mmu_save_page_pte((uint32_t)r2_page);
+		mmu_set_page_no_access((uint32_t)r2_page);
+		lldbg("R2: 'r2_test_page' registered and protected (no access)\n");
+		lldbg("R2: >>> deliberate bad write - expect Data Abort + MMU FAULT REPORT <<<\n");
+
+		/* Step 4: Deliberate bad write - aborts and PANICs */
+		*(volatile uint32_t *)r2_page = 0xDEADBEEF;
+
+		/* Not reached.  Restore defensively if the abort did not fire. */
+		mmu_restore_page_pte((uint32_t)r2_page, saved_pte);
+		ret = OK;
+		break;
+	}
+#endif
+
 #ifdef CONFIG_EXAMPLES_MMU_PROTECT_TEST
 	case TESTIOC_WDOG_MMU_PROTECT_TEST: {
 		/* Verify watchdog MMU page protection.

@@ -160,7 +160,7 @@
 #define DFSR_STATUS_SHIFT    (0)	/* Bits 0-3: Type of exception generated (w/EXT and FS) */
 #define DFSR_STATUS_MASK     (15 << DFSR_STATUS_SHIFT)
 #define DFSR_DOMAIN_SHIFT    (4)	/* Bits 4-7: Domain accessed when a data fault occurred */
-#define DFSR_DOMAIN_MASK     (15 << DFSR_STATUS_MASK)
+#define DFSR_DOMAIN_MASK     (15 << DFSR_DOMAIN_SHIFT)
 /* Bits 8-9: Reserved */
 #define DFSR_FS              (1 << 10)	/* Bit 10: Part of the STATUS field */
 #define DFSR_WNR             (1 << 11)	/* Bit 11: Not read and write */

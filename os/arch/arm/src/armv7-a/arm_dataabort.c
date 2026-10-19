@@ -59,8 +59,11 @@
 #include <tinyara/page.h>
 #include "arm.h"
 #endif
-#ifdef CONFIG_APP_BINARY_SEPARATION
+#if defined(CONFIG_APP_BINARY_SEPARATION) || defined(CONFIG_MMU_FAULT_REPORT)
 #include "mmu.h"
+#endif
+#ifdef CONFIG_MMU_FAULT_REPORT
+#include <tinyara/mmu.h>
 #endif
 
 /****************************************************************************
@@ -71,6 +74,123 @@ uint32_t system_exception_location;
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
+
+#ifdef CONFIG_MMU_FAULT_REPORT
+/****************************************************************************
+ * Name: mmu_fault_status_str
+ *
+ * Description:
+ *   Decode the ARMv7-A short-format fault status (FS[3:0]).
+ *
+ ****************************************************************************/
+
+static inline const char *mmu_fault_status_str(uint32_t fs)
+{
+	switch (fs) {
+	case 0x1:
+		return "alignment fault";
+	case 0x3:
+		return "access flag fault (section)";
+	case 0x4:
+		return "instruction cache maintenance fault";
+	case 0x5:
+		return "translation fault (section)";
+	case 0x6:
+		return "access flag fault (page)";
+	case 0x7:
+		return "translation fault (page)";
+	case 0x9:
+		return "domain fault (section)";
+	case 0xb:
+		return "domain fault (page)";
+	case 0xc:
+		return "background/TLB conflict fault (first level)";
+	case 0xd:
+		return "permission fault (section)";
+	case 0xe:
+		return "background fault (second level)";
+	case 0xf:
+		return "permission fault (page)";
+	default:
+		return "reserved fault status";
+	}
+}
+
+/****************************************************************************
+ * Name: print_mmu_fault_report
+ *
+ * Description:
+ *   R2 mitigation: decode the data abort and identify the culprit - fault
+ *   class, read/write direction, domain, task (pid and name), and the
+ *   protected region that was hit (region registry lookup, M0-6).
+ *
+ *   Abort-context safety rules (Gate 1 "report without nested fault"):
+ *   no allocation, no locks, fixed-size table scan, and TCB fields are
+ *   only read when the TCB itself cannot be inside a protected region
+ *   (documented Defect-3 nested-abort failure mode).
+ *
+ * Input Parameters:
+ *   regs - The saved processor context (for the faulting PC).
+ *   dfar - Data Fault Address Register value.
+ *   dfsr - Data Fault Status Register value.
+ *
+ ****************************************************************************/
+
+static inline void print_mmu_fault_report(uint32_t *regs, uint32_t dfar,
+					  uint32_t dfsr)
+{
+	struct tcb_s *tcb = this_task();
+	const char *region_name;
+	const char *task_name = "<unreadable>";
+	size_t region_size = 0;
+	uint32_t fs;
+	int tcb_safe;
+
+	/* Fault status: FS[4] lives at bit 10, FS[3:0] at bits 3:0 */
+
+	fs = dfsr & DFSR_STATUS_MASK;
+
+	/* Nested-fault guard: the TCB may sit inside a protected region
+	 * (Defect-3) or the faulting address may be the TCB itself.  In
+	 * either case, skip reading the task name to avoid a nested abort.
+	 */
+
+	tcb_safe = (tcb != NULL) &&
+		   !((uintptr_t)tcb <= (uintptr_t)dfar &&
+		     (uintptr_t)dfar < (uintptr_t)tcb + sizeof(struct tcb_s)) &&
+		   (mmu_protect_region_lookup((uintptr_t)tcb, NULL) == NULL);
+
+	if (tcb_safe && tcb->group != NULL) {
+		task_name = tcb->name;
+	}
+
+	region_name = mmu_protect_region_lookup((uintptr_t)dfar, &region_size);
+
+	lldbg_noarg("\n");
+	lldbg("MMU DATA ABORT REPORT\n");
+	lldbg("  CPU%u ", (unsigned int)up_cpu_index());
+	if (tcb != NULL) {
+		lldbg("pid=%d task=%s\n", (int)tcb->pid, task_name);
+	} else {
+		lldbg("pid=? task=%s\n", task_name);
+	}
+
+	lldbg("  PC=0x%08x DFAR=0x%08x access=%s\n", regs[REG_PC], dfar,
+	      (dfsr & DFSR_WNR) ? "WRITE" : "READ");
+	lldbg("  status=0x%02lx %s domain=%lu\n", (unsigned long)fs,
+	      mmu_fault_status_str(fs),
+	      (unsigned long)((dfsr & DFSR_DOMAIN_MASK) >> DFSR_DOMAIN_SHIFT));
+
+	if (region_name != NULL) {
+		lldbg("  >>> PROTECTED REGION HIT: '%s' (0x%08x, %u bytes) <<<\n",
+		      region_name, (unsigned int)dfar, (unsigned int)region_size);
+	} else {
+		lldbg("  no registered protected region contains DFAR\n");
+	}
+
+	lldbg("MMU DATA ABORT REPORT END\n");
+}
+#endif /* CONFIG_MMU_FAULT_REPORT */
 
 /****************************************************************************
  * Name: print_dataabort_detail
@@ -84,6 +204,9 @@ static inline void print_dataabort_detail(uint32_t *regs, uint32_t dfar, uint32_
 	_alert("PANIC!!! Data Abort at instruction : 0x%08x\n",  regs[REG_PC]);
 	_alert("PC: %08x DFAR: %08x DFSR: %08x\n", regs[REG_PC], dfar, dfsr);
 	_alert("#########################################################################\n\n\n");
+#ifdef CONFIG_MMU_FAULT_REPORT
+	print_mmu_fault_report(regs, dfar, dfsr);
+#endif
 }
 
 /****************************************************************************

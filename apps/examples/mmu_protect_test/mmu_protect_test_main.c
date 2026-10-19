@@ -120,6 +120,9 @@
 #define TESTIOC_AL_SMP_RESTORE        _TESTIOC(49)
 #define TESTIOC_AL_SMP_SPLIT          _TESTIOC(50)
 #define TESTIOC_AL_R1_SPLIT_CORRECTNESS _TESTIOC(51)
+#ifdef CONFIG_MMU_FAULT_REPORT
+#define TESTIOC_MMU_REGION_REPORT     _TESTIOC(52)
+#endif
 #endif /* CONFIG_MMU_PAGE_PROTECT */
 
 /* ioctl arg values: 0 = read test, 1 = write test */
@@ -188,6 +191,9 @@ static void mmu_protect_test_usage(void)
 	printf("  al_smp_ro             - TC-AL-07: SMP RO write -> Data Abort (fatal)\n");
 	printf("  al_smp_restore        - TC-AL-08: SMP restore (safe)\n");
 	printf("  al_smp_split          - TC-AL-09: SMP section split (safe)\n");
+#endif
+#ifdef CONFIG_MMU_FAULT_REPORT
+	printf("  region_report         - TC-R2: Fault report probe - register+protect+corrupt (fatal)\n");
 #endif
 #endif
 	printf("\n");
@@ -505,6 +511,32 @@ int mmu_protect_test_main(int argc, char *argv[])
 		close(fd);
 		return ret;
 	}
+#ifdef CONFIG_MMU_FAULT_REPORT
+	else if (strcmp(argv[1], "region_report") == 0) {
+		printf("=== MMU Fault Report Test (R2) ===\n");
+		printf("[mmu_protect_test] Registers 'r2_test_page', protects it, then corrupts it.\n");
+		printf("[mmu_protect_test] FATAL: expect Data Abort with full fault report before PANIC.\n");
+
+		fd = open(OS_API_TEST_DRVPATH, O_RDWR);
+		if (fd < 0) {
+			printf("[mmu_protect_test] FAIL: cannot open %s (errno %d)\n",
+			       OS_API_TEST_DRVPATH, errno);
+			printf("[mmu_protect_test] Is CONFIG_DRIVERS_OS_API_TEST enabled?\n");
+			return ERROR;
+		}
+
+		ret = ioctl(fd, TESTIOC_MMU_REGION_REPORT, 0);
+
+		if (ret == OK) {
+			printf("[mmu_protect_test] UNEXPECTED: survived the bad write - report not exercised?\n");
+		} else {
+			printf("[mmu_protect_test] ioctl returned %d (errno %d)\n", ret, errno);
+		}
+
+		close(fd);
+		return ret;
+	}
+#endif /* CONFIG_MMU_FAULT_REPORT */
 #endif /* CONFIG_MMU_PAGE_PROTECT */
 	else {
 

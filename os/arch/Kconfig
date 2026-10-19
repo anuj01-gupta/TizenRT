@@ -131,6 +131,21 @@ config MMU_PAGE_PROTECT
 
 		Currently untested — enable only for development.
 
+config MMU_FAULT_REPORT
+	bool "MMU data abort fault report (decode DFSR + region lookup)"
+	default y
+	depends on MMU_PAGE_PROTECT
+	---help---
+		Enable the MMU data abort fault report. On every data abort the
+		abort handler decodes the fault status (fault class, read/write
+		direction, domain), prints the faulting task (pid and name), and
+		looks up the protected region registry to name the region that
+		was hit (R2 mitigation, design items M0-5 / M0-6).
+
+		Abort-context safe: no allocation, no locks, fixed-size table
+		scan, TCB reads guarded against nested faults (Gate 1 criterion:
+		"report without nested fault").
+
 config ARCH_HAVE_FETCHADD
         bool
         default n

@@ -155,6 +155,10 @@ CMN_ASRCS += cp15_invalidate_dcache_all.S cp15_invalidate_dcache.S
 CMN_CSRCS += arm_cache.c arm_dataabort.c up_interruptcontext.c
 CMN_CSRCS += arm_doirq.c arm_gicv2.c arm_gicv2_dump.c
 CMN_CSRCS += arm_initialstate.c arm_mmu.c arm_prefetchabort.c
+# MMU protected region registry for the fault report (R2).
+# Compiles empty unless CONFIG_MMU_FAULT_REPORT is selected (only enabled
+# in build/configs/rtl8730e/loadable_ext_ddr).
+CMN_CSRCS += arm_mmu_region_registry.c
 CMN_CSRCS += arm_schedulesigaction.c arm_sigdeliver.c arm_schedyield.c
 CMN_CSRCS += arm_syscall.c arm_tcbinfo.c arm_undefinedinsn.c
 CMN_CSRCS += arm_perf.c arm_unblocktask_withoutsavereg.c up_checkspace.c up_restoretask.c

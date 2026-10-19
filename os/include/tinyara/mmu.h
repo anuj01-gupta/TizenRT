@@ -145,6 +145,57 @@ void mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte);
 #endif /* CONFIG_MMU_PAGE_PROTECT */
 
 /****************************************************************************
+ * Protected Region Registry (MMU fault report, R2 mitigation)
+ *
+ * Named registry of protected regions. The data abort handler looks up
+ * the faulting address so the fault report can identify which protected
+ * region was hit (design item M0-6). Producers of protected regions
+ * (test driver, watchdog pool, heap sanitizer) register here.
+ *
+ * Abort-context safe: lookup performs no allocation and takes no locks.
+ ****************************************************************************/
+
+#ifdef CONFIG_MMU_FAULT_REPORT
+
+/****************************************************************************
+ * Name: mmu_protect_region_register
+ *
+ * Description:
+ *   Register a named region so the MMU fault report can name it when a
+ *   faulting address falls inside it. Re-registering the identical
+ *   region (same name, address and size) is idempotent.
+ *
+ * Input Parameters:
+ *   name  - Region name; the string must have static storage duration.
+ *   vaddr - Region start virtual address.
+ *   size  - Region size in bytes.
+ *
+ * Returned Value:
+ *   OK (0) on success, or a negated errno value on failure.
+ ****************************************************************************/
+
+int mmu_protect_region_register(const char *name, uintptr_t vaddr, size_t size);
+
+/****************************************************************************
+ * Name: mmu_protect_region_lookup
+ *
+ * Description:
+ *   Look up the registered region containing the given virtual address.
+ *   Safe to call from abort context.
+ *
+ * Input Parameters:
+ *   vaddr - Virtual address to look up.
+ *   psize - Optional (may be NULL) location to store the region size.
+ *
+ * Returned Value:
+ *   The region name, or NULL if no registered region contains the address.
+ ****************************************************************************/
+
+const char *mmu_protect_region_lookup(uintptr_t vaddr, size_t *psize);
+
+#endif /* CONFIG_MMU_FAULT_REPORT */
+
+/****************************************************************************
  * ARM CP15 and Performance Counter Inline Functions
  *
  * These are static inline to avoid linker conflicts when included from
