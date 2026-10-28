@@ -103,6 +103,26 @@
 #define TESTIOC_AL_SMP_RESTORE			_TESTIOC(49)
 #define TESTIOC_AL_SMP_SPLIT			_TESTIOC(50)
 #define TESTIOC_AL_R1_SPLIT_CORRECTNESS		_TESTIOC(51)
+
+/* TC-R3: TLB/performance gate benchmark (safe).  arg = pointer to
+ * struct mmu_tlb_bench_s filled by the driver (may be NULL to only
+ * print the lldbg report). */
+#define TESTIOC_MMU_TLB_BENCH			_TESTIOC(53)
+
+struct mmu_tlb_bench_s {
+	uint32_t baseline_us;	/* Phase A: workload, 1MB sections */
+	uint32_t split_us;	/* Phase B: same workload, L2 4KB pages */
+	uint32_t overhead_pct;	/* (split-baseline)*100/baseline */
+	uint32_t split_cost_us;	/* Phase C: one runtime section split */
+	uint32_t op_cost_us;	/* Phase D: one protect+restore pair */
+	uint32_t sections_split;/* L2 tables consumed by the working set */
+};
+
+/* TC-R4: allocator UAF-protection stress.  arg = phase 1..4 (4 = FATAL) */
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+#define TESTIOC_MMU_HEAP_PROTECT_STRESS		_TESTIOC(54)
+#endif
+
 #ifdef CONFIG_MMU_FAULT_REPORT
 #define TESTIOC_MMU_REGION_REPORT		_TESTIOC(52)
 #endif

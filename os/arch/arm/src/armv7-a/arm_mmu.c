@@ -53,6 +53,7 @@
 #endif
 
 #ifdef CONFIG_MMU_PAGE_PROTECT
+#include <tinyara/irq.h>	/* enter/leave_critical_section for R4 save table */
 #ifdef CONFIG_SMP
 #include "gic.h"
 #include "smp.h"
@@ -107,40 +108,25 @@ uint32_t *mmu_l1_pgtable_safe(void)
  * L1 data cache. Without this, the MMU page table walker reads the old
  * PTE from the data cache after TLBIALL, and the protection has no effect.
  *
- * This is non-blocking: the requesting CPU sends SGI4 and returns immediately.
- * The target CPU flushes its TLB asynchronously when the SGI is handled.
+ * Blocking: the requesting CPU sends SGI4 and spin-waits for the ack set
+ * here (see mmu_invalidate_tlb_bymva_is).  Keep this handler free of
+ * console I/O: every print here delays the ack and serializes both cores.
  */
 int mmu_tlb_flush_sgi_handler(int irq, void *context, void *arg)
 {
 	uint32_t pte_addr = g_tlb_flush_pte_addr;
-	uint32_t pte_before;
-	uint32_t sctlr, ttbr0, dacr;
+	uint32_t dacr;
 
-	/* Read system control registers to verify MMU state */
-	__asm__ volatile("mrc p15, 0, %0, c1, c0, 0" : "=r"(sctlr));  /* SCTLR */
-	__asm__ volatile("mrc p15, 0, %0, c2, c0, 0" : "=r"(ttbr0));  /* TTBR0 */
+	/* Silent on the normal path: this handler runs on the peer core
+	 * while the requester spin-waits for the ack below, so every
+	 * print here directly inflates the cross-core TLB sync latency.
+	 * Only a real misconfiguration is reported.
+	 */
 	__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr));   /* DACR */
-
-	pte_before = *(volatile uint32_t *)pte_addr;
-
-	lldbg("SGI4: === ENTER on CPU%d ===\n", this_cpu());
-	lldbg("SGI4: SCTLR=0x%08x (MMU=%d DC=%d IC=%d)\n",
-	      sctlr, sctlr & 1, (sctlr >> 2) & 1, (sctlr >> 12) & 1);
-	lldbg("SGI4: TTBR0=0x%08x (base=0x%08x)\n", ttbr0, ttbr0 & 0xFFFFC000);
-	lldbg("SGI4: DACR=0x%08x (dom0=%s dom1=%s)\n",
-	      dacr,
-	      (dacr & 0x3) == 0 ? "NO_ACCESS" :
-	      (dacr & 0x3) == 1 ? "CLIENT" :
-	      (dacr & 0x3) == 3 ? "MANAGER" : "RESERVED",
-	      ((dacr >> 2) & 0x3) == 0 ? "NO_ACCESS" :
-	      ((dacr >> 2) & 0x3) == 1 ? "CLIENT" :
-	      ((dacr >> 2) & 0x3) == 3 ? "MANAGER" : "RESERVED");
-	lldbg("SGI4: pte_addr=0x%08x pte_before=0x%08x (AP=0x%x type=0x%x)\n",
-	      pte_addr, pte_before, (pte_before >> 4) & 3, pte_before & 3);
 
 	/* CRITICAL CHECK: If domain 0 is MANAGER, AP bits are IGNORED! */
 	if ((dacr & 0x3) == 3) {
-		lldbg("SGI4: !!! DOMAIN 0 IS MANAGER — AP BITS IGNORED! THIS IS THE BUG !!!\n");
+		lldbg("SGI4: DOMAIN 0 IS MANAGER - AP BITS IGNORED!\n");
 	}
 
 	/* Invalidate dcache line for pte_addr — removes stale PTE from this CPU's L1 dcache */
@@ -151,8 +137,6 @@ int mmu_tlb_flush_sgi_handler(int irq, void *context, void *arg)
 	__asm__ volatile("mcr p15, 0, r0, c8, c7, 0");  /* TLBIALL */
 	ARM_DSB();
 	ARM_ISB();
-
-	lldbg("SGI4: TLBIALL done, signaling completion\n");
 
 	/* ACK: set g_tlb_flush_done so Core 0 can stop spin-waiting */
 	g_tlb_flush_done = 1;
@@ -170,7 +154,7 @@ int mmu_tlb_flush_sgi_handler(int irq, void *context, void *arg)
  * This is guaranteed to work because GIC SGI is already used for
  * CPU start/pause/hotplug on this hardware.
  *
- * Non-blocking: sends SGI4 to all other cores and returns immediately.
+ * Blocking: sends SGI4 to each other core and spin-waits for its ack.
  */
 static inline void mmu_invalidate_tlb_bymva_is(uint32_t vaddr)
 {
@@ -209,18 +193,10 @@ static inline void mmu_invalidate_tlb_bymva_is(uint32_t vaddr)
 	ARM_DSB();
 	ARM_ISB();
 
-	lldbg("TLB_IS: CPU%d local TLB flushed for vaddr=0x%08x, sending SGI4\n", me, vaddr);
-
 	/* 5. Send SGI4 to all other cores */
 	for (cpu = 0; cpu < CONFIG_SMP_NCPUS; cpu++) {
 		if (cpu == me) {
 			continue;
-		}
-		{
-			uint32_t pte_val = *(volatile uint32_t *)g_tlb_flush_pte_addr;
-			lldbg("TLB_IS: CPU%d sending SGI4 to CPU%d (vaddr=0x%08x pte_addr=0x%08x pte_val=0x%08x AP=0x%x type=0x%x)\n",
-			       me, cpu, vaddr, g_tlb_flush_pte_addr, pte_val,
-			       (pte_val >> 4) & 3, pte_val & 3);
 		}
 		arm_cpu_sgi(GIC_IRQ_SGI4, (1 << cpu));
 
@@ -231,10 +207,8 @@ static inline void mmu_invalidate_tlb_bymva_is(uint32_t vaddr)
 				/* Invalidate dcache line to force re-read from memory */
 				cp15_invalidate_dcacheline_bymva((uint32_t)&g_tlb_flush_done);
 			}
-			if (g_tlb_flush_done) {
-				lldbg("TLB_IS: CPU%d acknowledged TLB flush\n", cpu);
-			} else {
-				lldbg("TLB_IS: TIMEOUT waiting for CPU%d!\n", cpu);
+			if (g_tlb_flush_done == 0) {
+				lldbg("TLB_IS: TIMEOUT waiting for CPU%d ack\n", cpu);
 			}
 		}
 		/* Reset flag for next CPU (if multiple) */
@@ -785,33 +759,41 @@ void mmu_split_section_to_l2(uint32_t vaddr)
 	uint32_t *l1table;
 	uint32_t l1_index;
 	uint32_t phys_base;
-	static uint32_t s_l2_table[256] __attribute__((aligned(1024)));
+	/* R6: static pool of L2 tables - one table per split section.
+	 * A single shared table (as before) corrupts every previously
+	 * split section when a second section overwrites it.  Pool size
+	 * caps how many 1MB sections can ever be page-protected:
+	 * 24 tables = 24MB protectable.  Exhaustion is visible (lldbg +
+	 * mmu_protect_get_counters failed_budget), never silent. */
+#define MMU_L2_POOL_NENTRIES 24
+	static uint32_t s_l2_pool[MMU_L2_POOL_NENTRIES][256] __attribute__((aligned(1024)));
+	static int s_l2_pool_next;
 	uint32_t *l2table;
 	int i;
-
-	lldbg("SPLIT_RUNTIME: vaddr=0x%08x section=0x%08x l1_entry=0x%08x\n",
-	      vaddr, section_addr, l1_entry);
-	lldbg("SPLIT_RUNTIME: s_l2_table at 0x%08x\n", (uint32_t)s_l2_table);
 
 	/* Only split if currently mapped as a 1MB section */
 	if ((l1_entry & PMD_TYPE_MASK) != PMD_TYPE_SECT) {
 		/* Already an L2 page table or fault — nothing to do */
-		lldbg("SPLIT: not a section (type=0x%x), skipping\n",
-		      l1_entry & PMD_TYPE_MASK);
 		return;
 	}
+
+	/* R6 guard: take the next free L2 table from the pool.  On
+	 * exhaustion, refuse to split (the caller must not fall back to
+	 * touching the section - that would block a whole 1MB). */
+	if (s_l2_pool_next >= MMU_L2_POOL_NENTRIES) {
+		lldbg("SPLIT: L2 pool EXHAUSTED (%d tables) - refusing to split 0x%08x\n",
+		      MMU_L2_POOL_NENTRIES, section_addr);
+		return;
+	}
+
+	l2table = s_l2_pool[s_l2_pool_next];
+	s_l2_pool_next++;	/* consumed: every split section keeps its table */
 
 	l1table = mmu_l1_pgtable_safe();
 	l1_index = section_addr >> 20;
 
 	/* Extract the physical base address from the section entry */
 	phys_base = l1_entry & PMD_SECT_PADDR_MASK;
-
-	lldbg("SPLIT: l1table=0x%08x l1_index=%d phys_base=0x%08x\n",
-	      (uint32_t)l1table, l1_index, phys_base);
-
-	l2table = s_l2_table;
-
 
 	/* Build L2 small page entries for all 256 pages in the 1MB section.
 	 * Translate the section flags to L2 small page flags:
@@ -867,25 +849,6 @@ void mmu_split_section_to_l2(uint32_t vaddr)
 	}
 
 
-	/* Debug: dump first 3 L2 entries and the wdog page entry */
-	lldbg("SPLIT: L2[0]=0x%08x L2[1]=0x%08x L2[2]=0x%08x\n",
-	      l2table[0], l2table[1], l2table[2]);
-	lldbg("SPLIT: L2[0x13]=0x%08x (wdog page entry, index=0x13)\n",
-	      l2table[0x13]);
-	lldbg("SPLIT: l1_entry flags: AP=0x%x TEX=0x%x C=%d B=%d S=%d\n",
-
-	      (l1_entry >> PMD_SECT_AP_SHIFT) & 3,
-	      (l1_entry & PMD_SECT_TEX_MASK) >> PMD_SECT_TEX_SHIFT,
-	      (l1_entry & PMD_SECT_C) ? 1 : 0,
-	      (l1_entry & PMD_SECT_B) ? 1 : 0,
-	      (l1_entry & PMD_SECT_S) ? 1 : 0);
-	lldbg("SPLIT: L2[0] flags:   AP=0x%x TEX=0x%x C=%d B=%d S=%d\n",
-	      (l2table[0] >> PTE_AP_SHIFT) & 3,
-	      (l2table[0] & 0x1C0) >> 6,
-	      (l2table[0] & PTE_C) ? 1 : 0,
-	      (l2table[0] & PTE_B) ? 1 : 0,
-	      (l2table[0] & PTE_S) ? 1 : 0);
-
 	/* CRITICAL: Clean data cache for the entire L2 table before
 	 * changing the L1 entry.  The MMU page table walker reads from
 	 * RAM, not from the data cache.  If the L2 entries are still
@@ -904,7 +867,7 @@ void mmu_split_section_to_l2(uint32_t vaddr)
 
 	/* Replace the L1 section entry with an L1 PTE pointing to our L2 table.
 	 * On this platform VA==PA for kernel RAM, so the virtual address of
-	 * s_l2_table is also its physical address.
+	 * the pool L2 table is also its physical address.
 	 *
 	 * Build the L1 PTE entry from scratch using only the type, domain, and
 	 * page table address.  Do NOT use MMU_L1_PGTABFLAGS because it includes
@@ -921,6 +884,12 @@ void mmu_split_section_to_l2(uint32_t vaddr)
 		new_l1 |= (l1_entry & PMD_SECT_DOM_MASK);
 
 		l1table[l1_index] = new_l1;
+
+		/* Post-condition: silent unless the split failed */
+		if ((l1table[l1_index] & PMD_TYPE_MASK) != PMD_TYPE_PTE) {
+			lldbg("SPLIT: L1[0x%x] not a page table: 0x%08x\n",
+			      l1_index, l1table[l1_index]);
+		}
 	}
 
 
@@ -936,7 +905,7 @@ void mmu_split_section_to_l2(uint32_t vaddr)
 	 * Core 1 still sees the 1MB section with RW and bypasses the protection.
 	 *
 	 * Fix: replace the kernel L1 section with an L1 PTE pointing to the
-	 * SAME s_l2_table. Then both cores walk the same L2 table and see
+	 * SAME pool L2 table. Then both cores walk the same L2 table and see
 	 * the same AP bits.
 	 */
 	{
@@ -953,9 +922,6 @@ void mmu_split_section_to_l2(uint32_t vaddr)
 			kern_l1[l1_index] = new_kern_l1;
 			cp15_clean_dcache_bymva((uint32_t)&kern_l1[l1_index]);
 			ARM_DSB();
-
-			lldbg("SPLIT: kernel L1[0x%x] = 0x%08x (was section 0x%08x)\n",
-			      l1_index, new_kern_l1, kern_entry);
 		}
 	}
 
@@ -1071,21 +1037,6 @@ void mmu_set_page_no_access(uint32_t vaddr)
 		/* L1 points to an L2 page table */
 		uint32_t *l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
 		uint32_t l2_index = (page_addr & 0x000FF000) >> 12;
-		uint32_t dacr;
-
-		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr));
-		lldbg("SET_NO_ACCESS: CPU%d DACR=0x%08x (dom0=%s) l1_entry=0x%08x (dom=%d)\n",
-		      this_cpu(), dacr,
-		      (dacr & 0x3) == 0 ? "NO_ACCESS" :
-		      (dacr & 0x3) == 1 ? "CLIENT" :
-		      (dacr & 0x3) == 3 ? "MANAGER" : "RESERVED",
-		      l1_entry, (l1_entry >> 5) & 0xF);
-		lldbg("SET_NO_ACCESS: vaddr=0x%08x l2table=0x%08x l2_index=%d pte_addr=0x%08x\n",
-		      page_addr, (uint32_t)l2table, l2_index, (uint32_t)&l2table[l2_index]);
-		lldbg("SET_NO_ACCESS: PTE before=0x%08x (AP=0x%x AP2=%d type=0x%x)\n",
-		      l2table[l2_index], (l2table[l2_index] >> 4) & 3,
-		      (l2table[l2_index] >> 9) & 1, l2table[l2_index] & 3);
-
 
 		/* Set AP=00 (No Access at any privilege level).
 		 * Must clear both AP[1:0] (bits 4-5, PTE_AP_MASK) and
@@ -1094,13 +1045,13 @@ void mmu_set_page_no_access(uint32_t vaddr)
 		 * read accesses would NOT fault. */
 		l2table[l2_index] = (l2table[l2_index] & ~PTE_AP_MASK & ~PTE_AP2) | PTE_AP_NONE;
 
-		lldbg("SET_NO_ACCESS: PTE after write=0x%08x (AP=0x%x type=0x%x)\n",
-		      l2table[l2_index], (l2table[l2_index] >> 4) & 3, l2table[l2_index] & 3);
-
 		cp15_clean_dcache_bymva((uint32_t)&l2table[l2_index]);
 
-		lldbg("SET_NO_ACCESS: PTE after clean=0x%08x (AP=0x%x type=0x%x)\n",
-		      l2table[l2_index], (l2table[l2_index] >> 4) & 3, l2table[l2_index] & 3);
+		/* Post-condition: silent unless AP really failed to clear */
+		if ((l2table[l2_index] & (PTE_AP_MASK | PTE_AP2)) != 0) {
+			lldbg("SET_NO_ACCESS: AP clear failed pte=0x%08x\n",
+			      l2table[l2_index]);
+		}
 
 		mmu_invalidate_tlb_bymva_is(page_addr);
 	}
@@ -1242,3 +1193,232 @@ void mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte)
 	}
 }
 #endif
+
+/****************************************************************************
+ * Name: mmu_protect_range_no_access / mmu_restore_range (R4)
+ *
+ * Description:
+ *   Protect/unprotect every FULL 4KB page inside [vaddr, vaddr+len).
+ *   Ragged first/last pages are deliberately untouched, so a chunk
+ *   header or any neighbouring metadata sharing a boundary page can
+ *   never be locked.  If a page still lives in a 1MB section it is
+ *   split to L2 first (bounded by the static L2 pool); when the pool
+ *   is exhausted the range is skipped fail-safe (failed_budget
+ *   counter) - protection coverage is then known, not assumed.
+ *
+ *   mmu_protect_range_no_access(): saves each page's original PTE in
+ *   a bounded save table, then sets the page No-Access.  Re-protecting
+ *   an already-saved page is a no-op (prevents double-save which
+ *   would otherwise store the No-Access PTE as "original").
+ *
+ *   mmu_restore_range(): for each page found in the save table,
+ *   removes the entry and writes back the saved PTE.  Pages not in
+ *   the table were never locked - harmless no-op.
+ *
+ *   All return the number of pages actually affected.
+ *
+ ****************************************************************************/
+
+#if defined(CONFIG_MMU_PAGE_PROTECT) && !defined(CONFIG_ARCH_ROMPGTABLE)
+
+#define MM_PROTECT_SAVED_MAX 2048
+
+struct mmu_saved_pte_s {
+	uint32_t vaddr;		/* page-aligned virtual address */
+	uint32_t pte;		/* original (unlocked) PTE value */
+};
+
+static struct mmu_saved_pte_s g_protect_saved[MM_PROTECT_SAVED_MAX];
+static int g_protect_saved_count;
+
+static uint32_t g_protect_ok;		/* ranges protected */
+static uint32_t g_protect_skipped;	/* ranges too small / unmapped */
+static uint32_t g_protect_failed_budget;	/* L2/save-table exhausted */
+static volatile bool g_protect_enabled;		/* off until test driver arms it */
+
+/* Cap kept local (value mirrors MM_UAF_PROTECT_MAX_SIZE in tinyara/mm/mm.h):
+ * the arch build may not see kernel-side mm.h macros depending on KDEFINE. */
+#define MM_PROTECT_RANGE_MAX (128 * 1024)
+
+void mmu_set_uaf_protect_enabled(int on)
+{
+	g_protect_enabled = (on != 0);
+}
+
+static int mmu_saved_find(uint32_t page_addr)
+{
+	int i;
+
+	for (i = 0; i < g_protect_saved_count; i++) {
+		if (g_protect_saved[i].vaddr == page_addr) {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+int mmu_protect_range_no_access(uintptr_t vaddr, size_t len)
+{
+	uintptr_t first = (vaddr + SMALL_PAGE_MASK) & ~((uintptr_t)SMALL_PAGE_MASK);
+	uintptr_t last = ((uintptr_t)vaddr + len) & ~((uintptr_t)SMALL_PAGE_MASK);
+	uintptr_t page;
+	irqstate_t flags;
+	int protected_pages = 0;
+
+	if (!g_protect_enabled) {
+		return 0;		/* boot-safe: no page-table touch, no SGI4 */
+	}
+
+	if (len > MM_PROTECT_RANGE_MAX) {
+		g_protect_skipped++;	/* visible skip: mega free-run/region node */
+		return 0;
+	}
+
+	if (last <= first) {
+		g_protect_skipped++;
+		return 0;
+	}
+
+	for (page = first; page < last; page += SMALL_PAGE_SIZE) {
+		uint32_t l1_entry = mmu_l1_getentry((uint32_t)page);
+		uint32_t saved_pte;
+
+		if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_SECT) {
+			/* R6: split takes a table from the bounded pool */
+			mmu_split_section_to_l2((uint32_t)page);
+			l1_entry = mmu_l1_getentry((uint32_t)page);
+			if ((l1_entry & PMD_TYPE_MASK) != PMD_TYPE_PTE) {
+				/* Pool exhausted - fail-safe: skip, never
+				 * touch the section entry. */
+				g_protect_failed_budget++;
+				break;
+			}
+		}
+
+		if ((l1_entry & PMD_TYPE_MASK) != PMD_TYPE_PTE) {
+			/* Not mapped through L2 - cannot protect */
+			g_protect_skipped++;
+			continue;
+		}
+
+		flags = enter_critical_section();
+		if (mmu_saved_find((uint32_t)page) >= 0) {
+			/* Already protected - do not double-save */
+			leave_critical_section(flags);
+			protected_pages++;
+			continue;
+		}
+
+		if (g_protect_saved_count >= MM_PROTECT_SAVED_MAX) {
+			leave_critical_section(flags);
+			g_protect_failed_budget++;
+			break;
+		}
+
+		saved_pte = mmu_save_page_pte((uint32_t)page);
+		g_protect_saved[g_protect_saved_count].vaddr = (uint32_t)page;
+		g_protect_saved[g_protect_saved_count].pte = saved_pte;
+		g_protect_saved_count++;
+		leave_critical_section(flags);
+
+		mmu_set_page_no_access((uint32_t)page);
+		protected_pages++;
+	}
+
+	if (protected_pages > 0) {
+		g_protect_ok++;
+	} else {
+		g_protect_skipped++;
+	}
+
+	return protected_pages;
+}
+
+/* Pages taken out of the save table in one pass and restored afterwards,
+ * outside the critical section: mmu_restore_page_pte() does cache
+ * maintenance, a TLB invalidate and (SMP) an SGI4 round-trip, none of
+ * which should run with interrupts disabled. */
+#define MM_RESTORE_BATCH 64
+static struct mmu_saved_pte_s g_protect_pending[MM_RESTORE_BATCH];
+
+int mmu_restore_range(uintptr_t vaddr, size_t len)
+{
+	uintptr_t first = vaddr & ~((uintptr_t)SMALL_PAGE_MASK);
+	uintptr_t last = (vaddr + len + SMALL_PAGE_MASK) & ~((uintptr_t)SMALL_PAGE_MASK);
+	irqstate_t flags;
+	int count = 0;
+
+	/* The only boot-time effect of the R4 hooks: every large
+	 * mm_malloc/mm_free node (the 56MB region node qualifies) must not
+	 * turn into thousands of IRQ-off windows hunting an empty save
+	 * table.  An empty table costs one plain read, nothing more. */
+	if (g_protect_saved_count == 0) {
+		return 0;
+	}
+
+	/* Walk the save table, not the page range: the cost is O(locked
+	 * pages), never O(len / 4096) - mm_free() now locks chunks at their
+	 * allocated size, so restores are on the hot path.  The window here
+	 * is fully covering (floor..ceil) while
+	 * mmu_protect_range_no_access() locks interior pages only: a page
+	 * that is AP=0 can never carry a live chunk header, so widening the
+	 * unlock window can only ever recover real locks and can never
+	 * unlock a page another chunk relies on. */
+	for (;;) {
+		int i = 0;
+		int n = 0;
+
+		flags = enter_critical_section();
+
+		while (i < g_protect_saved_count && n < MM_RESTORE_BATCH) {
+			uintptr_t page = g_protect_saved[i].vaddr;
+
+			if (page < first || page >= last) {
+				i++;
+				continue;
+			}
+
+			g_protect_pending[n++] = g_protect_saved[i];
+
+			/* Swap-remove: the last entry fills the hole and
+			 * lands in slot i, so slot i must be re-tested
+			 * before advancing. */
+			g_protect_saved_count--;
+			if (i < g_protect_saved_count) {
+				g_protect_saved[i] = g_protect_saved[g_protect_saved_count];
+			}
+		}
+
+		leave_critical_section(flags);
+
+		for (i = 0; i < n; i++) {
+			mmu_restore_page_pte(g_protect_pending[i].vaddr,
+					     g_protect_pending[i].pte);
+			count++;
+		}
+
+		if (n < MM_RESTORE_BATCH) {
+			break;	/* table fully walked, nothing left to drain */
+		}
+	}
+
+	return count;
+}
+
+void mmu_protect_get_counters(uint32_t *ok, uint32_t *skipped,
+			      uint32_t *failed_budget)
+{
+	if (ok) {
+		*ok = g_protect_ok;
+	}
+
+	if (skipped) {
+		*skipped = g_protect_skipped;
+	}
+
+	if (failed_budget) {
+		*failed_budget = g_protect_failed_budget;
+	}
+}
+#endif	/* CONFIG_MMU_PAGE_PROTECT && !CONFIG_ARCH_ROMPGTABLE */

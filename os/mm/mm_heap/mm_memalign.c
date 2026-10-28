@@ -214,6 +214,10 @@ retry_after_gc:
 		/* Get the next node after the allocation. */
 		FAR struct mm_allocnode_s *next = (FAR struct mm_allocnode_s *)((char *)node + node->size);
 
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+		MM_UAF_PROTECT_BEFORE_USE(node);
+#endif
+
 #ifdef CONFIG_DEBUG_MM_UAF
 		mm_uaf_verify(node);
 #endif

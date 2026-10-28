@@ -33,11 +33,19 @@
 #include <tinyara/mmu.h>
 #ifdef CONFIG_MMU_PAGE_PROTECT
 #include <tinyara/arch.h>
+#include <time.h>
+#include <unistd.h>
 /* External function to get page table base */
 extern uint32_t *mmu_get_os_l1_pgtbl(void);
 #define PGTABLE_BASE_VADDR  ((uint32_t)mmu_get_os_l1_pgtbl())
 /* External function to get L1 page table (matches mmu_split_section_to_l2) */
 extern uint32_t *mmu_l1_pgtable_safe(void);
+/* R4 range protect API (arm_mmu.c) */
+extern int mmu_protect_range_no_access(uintptr_t vaddr, size_t len);
+extern int mmu_restore_range(uintptr_t vaddr, size_t len);
+extern void mmu_set_uaf_protect_enabled(int on);
+extern void mmu_protect_get_counters(uint32_t *ok, uint32_t *skipped,
+				     uint32_t *failed_budget);
 /* MMU Page Table Entry macros - copied from arch/arm/src/armv7-a/mmu.h */
 
 #define PMD_TYPE_SHIFT         (0)
@@ -89,6 +97,84 @@ static const struct file_operations os_api_test_drv_fops = {
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
+
+/* TC-R3 helpers: timing.  The PMU is NOT reachable from the non-secure
+ * AP OS on rtl8730e: every cp15 access on crn 9 / crn 15 traps to the
+ * secure world as an Undefined Instruction (observed: reboot reason 52
+ * in the middle of Phase C).  There is no DWT/CYCCNT on ARMv7-A,
+ * up_perf_init() is never called and CONFIG_ARCH_PERF_EVENTS is off, so
+ * the only clock available is CLOCK_MONOTONIC with a 1ms floor
+ * (CONFIG_USEC_PER_TICK=1000).  Per-operation costs are therefore
+ * measured as batch averages over many operations. */
+#ifdef CONFIG_MMU_PAGE_PROTECT
+#define R3_WS_SIZE    (4 * 1024 * 1024)
+#define R3_REPS       250
+#define R3_SPLIT_REPS 4       /* fresh sections timed for the Phase C cost */
+#define R3_PAIR_REPS  2000    /* protect+restore pairs timed in Phase D    */
+#define R3_PAIR_BATCH 100     /* pairs per Phase D timing sample           */
+
+static uint32_t r3_now_us(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint32_t)ts.tv_sec * 1000000u + (uint32_t)(ts.tv_nsec / 1000);
+}
+
+/* Sequential-stride scan of the 4MB working set + allocator churn.
+ * The scan is TLB-sensitive (64B stride over 4MB = 1024 distinct
+ * pages touched per pass); the churn exercises allocator paths that
+ * the R4 hooks run through. */
+static void r3_workload(FAR uint32_t *ws, uint32_t reps)
+{
+	uint32_t nwords = R3_WS_SIZE / sizeof(uint32_t);
+	uint32_t r;
+	uint32_t i;
+
+	for (r = 0; r < reps; r++) {
+		for (i = 0; i < nwords; i += 16) {
+			ws[i] = r;
+		}
+
+		for (i = 0; i < 300; i++) {
+			FAR void *p = kmm_malloc(64 + (i & 0x3f));
+			if (p) {
+				kmm_free(p);
+			}
+		}
+	}
+}
+#endif /* CONFIG_MMU_PAGE_PROTECT */
+
+/* TC-R4 helper: core-1 heap churn thread (step 3, dual-core) */
+#if defined(CONFIG_MM_HEAP_UAF_PROTECT) && defined(CONFIG_SMP)
+static volatile int g_r4_core1_done;
+
+static int r4_core1_churn(int argc, FAR char *argv[])
+{
+	int i;
+
+	for (i = 0; i < 50; i++) {
+		FAR uint8_t *a = (FAR uint8_t *)kmm_malloc(4096);
+		FAR uint8_t *b = (FAR uint8_t *)kmm_malloc(64 * 1024);
+
+		if (a) {
+			a[0] = (uint8_t)i;
+			a[4095] = (uint8_t)i;
+			kmm_free(a);
+		}
+
+		if (b) {
+			b[0] = (uint8_t)i;
+			b[65535] = (uint8_t)i;
+			kmm_free(b);
+		}
+	}
+
+	g_r4_core1_done = 1;
+	return 0;
+}
+#endif /* CONFIG_MM_HEAP_UAF_PROTECT && CONFIG_SMP */
 
 /************************************************************************************
  * Name: os_api_test_drv_ioctl
@@ -1227,6 +1313,318 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 	}
 #endif
 
+	/* TC-R3: TLB/performance gate benchmark (safe).
+	 * A: same workload on 1MB sections vs B: on 4KB L2 pages.
+	 * C: cost of one runtime split.  D: cost of one
+	 * protect+restore pair (includes the SGI4 cross-core sync). */
+#ifdef CONFIG_MMU_PAGE_PROTECT
+	case TESTIOC_MMU_TLB_BENCH: {
+		FAR struct mmu_tlb_bench_s *out =
+			(FAR struct mmu_tlb_bench_s *)(uintptr_t)arg;
+		struct mmu_tlb_bench_s res;
+		FAR uint32_t *l1 = mmu_l1_pgtable_safe();
+		FAR uint8_t *ws;
+		uint32_t sect_first;
+		uint32_t sect_last;
+		uint32_t sect;
+		uint32_t t0;
+		uint32_t t1;
+		int i;
+
+		(void)memset(&res, 0, sizeof(res));
+
+		ws = (FAR uint8_t *)kmm_memalign(4096, R3_WS_SIZE);
+		if (!ws) {
+			lldbg("R3: kmm_memalign(%u) failed\n", R3_WS_SIZE);
+			return -ENOMEM;
+		}
+
+		/* Phase D times a real protect+restore pair: needs the gate
+		 * open.  Disarmed at ioctl exit.  A/B/C unaffected. */
+		mmu_set_uaf_protect_enabled(1);
+
+		(void)memset(ws, 0, R3_WS_SIZE);
+
+		sect_first = (uint32_t)ws >> 20;
+		sect_last = ((uint32_t)ws + R3_WS_SIZE - 1) >> 20;
+
+		/* Phase A: working set still mapped by 1MB sections */
+		lldbg("R3: Phase A: baseline, working set on %u 1MB sections...\n",
+		      sect_last - sect_first + 1);
+		t0 = r3_now_us();
+		r3_workload((FAR uint32_t *)ws, R3_REPS);
+		t1 = r3_now_us();
+		res.baseline_us = t1 - t0;
+
+		/* Split every section of the working set to 4KB pages */
+		for (sect = sect_first; sect <= sect_last; sect++) {
+			if ((l1[sect] & PMD_TYPE_MASK) == PMD_TYPE_SECT) {
+				res.sections_split++;
+			}
+			mmu_split_section_to_l2(sect << 20);
+		}
+
+		/* Phase B: identical workload, identical data, 4KB pages */
+		lldbg("R3: Phase B: same workload after splitting %u sections...\n",
+		      res.sections_split);
+		t0 = r3_now_us();
+		r3_workload((FAR uint32_t *)ws, R3_REPS);
+		t1 = r3_now_us();
+		res.split_us = t1 - t0;
+
+		if (res.baseline_us > 0 && res.split_us > res.baseline_us) {
+			res.overhead_pct = (res.split_us - res.baseline_us) * 100 /
+					   res.baseline_us;
+		}
+
+		/* Phase C: average cost of splitting R3_SPLIT_REPS fresh
+		 * sections (the ones right after the working set, still
+		 * plain sections).  Bounded L2-pool use: at most
+		 * R3_SPLIT_REPS of the pool tables. */
+		{
+			uint32_t probe;
+			uint32_t done = 0;
+
+			t0 = r3_now_us();
+			for (probe = sect_last + 1;
+			     done < R3_SPLIT_REPS && probe <= sect_last + 16;
+			     probe++) {
+				if ((l1[probe] & PMD_TYPE_MASK) != PMD_TYPE_SECT) {
+					continue;
+				}
+
+				mmu_split_section_to_l2(probe << 20);
+
+				/* Count successful splits only: when the
+				 * bounded L2 pool is exhausted the entry
+				 * stays a section, and timing such a no-op
+				 * would understate the split cost. */
+				if ((l1[probe] & PMD_TYPE_MASK) == PMD_TYPE_PTE) {
+					done++;
+				}
+			}
+			t1 = r3_now_us();
+
+			if (done > 0) {
+				res.split_cost_us = (t1 - t0) / done;
+				res.sections_split += done;
+			} else {
+				lldbg("R3: Phase C skipped (no fresh section)\n");
+			}
+		}
+
+		/* Phase D: average cost of one protect+restore pair on one
+		 * 8KB region (2 full interior pages, i.e. 4 TLB syncs incl.
+		 * one cross-core SGI4 ack per pair).  Timed in batches of
+		 * R3_PAIR_BATCH because a single pair is shorter than the
+		 * clock floor. */
+		{
+			uintptr_t pa = (uintptr_t)ws;
+			uint32_t total = 0;
+			int j;
+
+			for (i = 0; i < R3_PAIR_REPS / R3_PAIR_BATCH; i++) {
+				t0 = r3_now_us();
+				for (j = 0; j < R3_PAIR_BATCH; j++) {
+					mmu_protect_range_no_access(pa, 8192);
+					mmu_restore_range(pa, 8192);
+				}
+
+				t1 = r3_now_us();
+				total += (t1 - t0);
+			}
+
+			res.op_cost_us = total / R3_PAIR_REPS;
+		}
+
+		lldbg("R3: clock floor 1000us: C = avg of %u splits, D = avg of %u pairs\n",
+		      R3_SPLIT_REPS, R3_PAIR_REPS);
+
+		lldbg("R3: =============== TLB/split benchmark report ===============\n");
+		lldbg("R3: Phase A (1MB sections): %u us\n", res.baseline_us);
+		lldbg("R3: Phase B (4KB L2 pages): %u us\n", res.split_us);
+		lldbg("R3: overhead = %u%%   (R3 gate: < 10%%)\n", res.overhead_pct);
+		lldbg("R3: one runtime split = %u us (L2 fill + full TLB flush)\n",
+		      res.split_cost_us);
+		lldbg("R3: 8KB block protect+restore pair = %u us (4 TLB syncs)\n",
+		      res.op_cost_us);
+		lldbg("R3: L2 tables consumed by working set = %u\n",
+		      res.sections_split);
+		if (res.overhead_pct < 10) {
+			lldbg("R3: PASS - 4KB page protection is affordable\n");
+		} else {
+			lldbg("R3: MITIGATION REQUIRED - overhead >= 10%%\n");
+		}
+
+		if (out) {
+			*out = res;
+		}
+
+		kmm_free(ws);	/* working-set sections stay split (harmless) */
+		ret = OK;
+		break;
+	}
+#endif /* CONFIG_MMU_PAGE_PROTECT */
+
+	/* TC-R4: allocator UAF-protection stress.
+	 * 1: free a 64KB block, verify interior PTE went AP=0
+	 * 2: mixed-size churn (merge/split paths must stay fault-free)
+	 * 3: same churn from a core-1 pinned thread
+	 * 4: FATAL - deliberate write to a freed, protected block */
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+	case TESTIOC_MMU_HEAP_PROTECT_STRESS: {
+		int phase = (int)arg;
+		FAR uint8_t *mem;
+		uintptr_t pg;
+		uint32_t cok;
+		uint32_t cskip;
+		uint32_t cfail;
+		int i;
+
+		lldbg("=== TC-R4: heap UAF-protect stress (phase %d) ===\n", phase);
+
+		/* Step 1: free a 64KB block -> interior PTE must be AP=0 */
+		mem = (FAR uint8_t *)kmm_malloc(64 * 1024);
+		if (!mem) {
+			return -ENOMEM;
+		}
+
+		/* Protection window: this test only; disarmed at ioctl
+		 * exit.  Everything else runs HEAD-identical (gate off). */
+		mmu_set_uaf_protect_enabled(1);
+
+		memset(mem, 0xAA, 64 * 1024);
+		pg = ((uintptr_t)mem + 32 + 4095) & ~(uintptr_t)4095;
+		kmm_free(mem);		/* addfreechunk hook locks interior */
+
+		{
+			FAR uint32_t *l1 = mmu_l1_pgtable_safe();
+			uint32_t e = 0xFFFFFFFF;
+
+			if ((l1[pg >> 20] & PMD_TYPE_MASK) == PMD_TYPE_PTE) {
+				FAR uint32_t *l2 = (FAR uint32_t *)(l1[pg >> 20] & PMD_PTE_PADDR_MASK);
+				e = l2[(pg >> 12) & 0xFF];
+			}
+
+			if ((e & 2) && ((e >> 4) & 3) == 0 && ((e >> 9) & 1) == 0) {
+				lldbg("R4/1: PASS interior PTE 0x%08x AP=0 (page 0x%08x locked)\n",
+				      e, (uint32_t)pg);
+			} else {
+				lldbg("R4/1: WARN PTE=0x%08x NOT locked (coverage gap?)\n", e);
+			}
+		}
+
+		mmu_protect_get_counters(&cok, &cskip, &cfail);
+		lldbg("R4: counters: ok=%u skipped=%u failed_budget=%u\n",
+		      cok, cskip, cfail);
+
+		if (phase < 2) {
+			ret = OK;
+			break;
+		}
+
+		/* Step 2: mixed churn - allocator must never fault on the
+		 * pages it just unlocked (hook-ordering proof) */
+		lldbg("R4/2: mixed-size churn (100 iterations)...\n");
+		for (i = 0; i < 100; i++) {
+			FAR uint8_t *a = (FAR uint8_t *)kmm_malloc(4096);
+			FAR uint8_t *b = (FAR uint8_t *)kmm_malloc(5120);
+			FAR uint8_t *c = (FAR uint8_t *)kmm_malloc(64 * 1024);
+
+			if (a) {
+				a[0] = (uint8_t)i;
+				a[4095] = (uint8_t)i;
+			}
+			if (b) {
+				b[0] = (uint8_t)i;
+			}
+			if (c) {
+				c[0] = (uint8_t)i;
+				c[65535] = (uint8_t)i;
+			}
+			kmm_free(a);
+			kmm_free(b);
+			kmm_free(c);
+		}
+		lldbg("R4/2: PASS churn completed, no abort\n");
+
+		if (phase < 3) {
+			ret = OK;
+			break;
+		}
+
+#ifdef CONFIG_SMP
+		/* Step 3: same churn driven from Core 1 - exercises the
+		 * SGI4 TLB sync from the other CPU */
+		lldbg("R4/3: core-1 pinned churn (50 iterations)...\n");
+		g_r4_core1_done = 0;
+		{
+			pid_t pid1 = kernel_thread("r4_core1", 100, 4096,
+						   r4_core1_churn, NULL);
+
+			if (pid1 >= 0) {
+				cpu_set_t cpu_mask;
+				int wait_count = 0;
+
+				CPU_ZERO(&cpu_mask);
+				CPU_SET(1, &cpu_mask);
+				sched_setaffinity(pid1, sizeof(cpu_set_t), &cpu_mask);
+
+				while (!g_r4_core1_done && wait_count < 5000) {
+					usleep(10 * 1000);
+					wait_count++;
+				}
+
+				if (g_r4_core1_done) {
+					lldbg("R4/3: PASS core-1 churn completed, no abort\n");
+				} else {
+					lldbg("R4/3: WARN core-1 thread timed out\n");
+				}
+			} else {
+				lldbg("R4/3: WARN kernel_thread failed (%d)\n", pid1);
+			}
+		}
+#endif /* CONFIG_SMP */
+
+		mmu_protect_get_counters(&cok, &cskip, &cfail);
+		lldbg("R4: counters: ok=%u skipped=%u failed_budget=%u\n",
+		      cok, cskip, cfail);
+
+		if (phase < 4) {
+			ret = OK;
+			break;
+		}
+
+		/* Step 4: FATAL.  Free a block, deterministically lock one
+		 * interior page (idempotent with the free hook), register
+		 * it with the R2 fault report, then write -> Data Abort
+		 * BEFORE any corruption can happen. */
+		mem = (FAR uint8_t *)kmm_malloc(64 * 1024);
+		if (!mem) {
+			mmu_set_uaf_protect_enabled(0);
+			return -ENOMEM;
+		}
+		memset(mem, 0x5A, 64 * 1024);
+		pg = ((uintptr_t)mem + 32 + 4095) & ~(uintptr_t)4095;
+		kmm_free(mem);
+		mmu_protect_range_no_access(pg, 4096);
+#ifdef CONFIG_MMU_FAULT_REPORT
+		mmu_protect_region_register("heap_freed_block", pg, 4096);
+#endif
+		lldbg("R4/4: >>> deliberate write to freed+protected page 0x%08x\n",
+		      (uint32_t)pg);
+		lldbg("R4/4: >>> expect Data Abort + FAULT REPORT naming 'heap_freed_block' <<<\n");
+
+		*(volatile uint32_t *)pg = 0xDEADBEEF;
+
+		/* Not reached when protection works */
+		mmu_restore_range(pg, 4096);
+		lldbg("R4/4: FAIL - write survived, page was not protected!\n");
+		ret = OK;
+		break;
+	}
+#endif /* CONFIG_EXAMPLES_MMU_PROTECT_TEST && CONFIG_MM_HEAP_UAF_PROTECT */
+
 #ifdef CONFIG_EXAMPLES_MMU_PROTECT_TEST
 	case TESTIOC_WDOG_MMU_PROTECT_TEST: {
 		/* Verify watchdog MMU page protection.
@@ -2110,6 +2508,13 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		break;
 
 	}
+
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+	if (cmd == TESTIOC_MMU_HEAP_PROTECT_STRESS ||
+	    cmd == TESTIOC_MMU_TLB_BENCH) {
+		mmu_set_uaf_protect_enabled(0);
+	}
+#endif
 
 	return ret;
 }

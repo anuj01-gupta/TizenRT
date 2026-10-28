@@ -822,6 +822,21 @@ config DEBUG_MM_UAF_PANIC
 
 endif # DEBUG_MM_UAF
 
+config MM_HEAP_UAF_PROTECT
+	bool "MMU-based use-after-free protection for heap chunks"
+	depends on MMU_PAGE_PROTECT
+	default n
+	---help---
+		Protect the data area of every freed heap chunk >= 4KB by
+		marking its full interior 4KB pages No-Access in the MMU.
+		A write to freed memory then triggers an immediate Data
+		Abort (with the R2 fault report naming the block) instead
+		of silently corrupting the heap.  Requires
+		CONFIG_MMU_PAGE_PROTECT (armv7-a runtime section split).
+		Protection coverage is bounded by a static L2 page-table
+		pool; skipped protections are counted and logged, never
+		silent.
+
 config DEBUG_IRQ
 	bool "Interrupt Controller Debug Feature"
 	default n

@@ -195,6 +195,12 @@ static void mmu_protect_test_usage(void)
 #ifdef CONFIG_MMU_FAULT_REPORT
 	printf("  region_report         - TC-R2: Fault report probe - register+protect+corrupt (fatal)\n");
 #endif
+#ifdef CONFIG_MMU_PAGE_PROTECT
+	printf("  tlb_bench             - TC-R3: TLB/split overhead benchmark (safe, ~5s)\n");
+#endif
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+	printf("  heap_protect [1-4]    - TC-R4: allocator UAF protection (1-3 safe, 4 fatal)\n");
+#endif
 #endif
 	printf("\n");
 
@@ -537,6 +543,86 @@ int mmu_protect_test_main(int argc, char *argv[])
 		return ret;
 	}
 #endif /* CONFIG_MMU_FAULT_REPORT */
+
+	else if (strcmp(argv[1], "tlb_bench") == 0) {
+		struct mmu_tlb_bench_s res;
+
+		printf("=== TLB / section-split benchmark (R3) ===\n");
+		printf("[mmu_protect_test] Takes ~5s. A: 1MB sections, B: same data on 4KB pages.\n");
+
+		fd = open(OS_API_TEST_DRVPATH, O_RDWR);
+		if (fd < 0) {
+			printf("[mmu_protect_test] FAIL: cannot open %s (errno %d)\n",
+			       OS_API_TEST_DRVPATH, errno);
+			return ERROR;
+		}
+
+		memset(&res, 0, sizeof(res));
+		ret = ioctl(fd, TESTIOC_MMU_TLB_BENCH, (unsigned long)&res);
+
+		if (ret == OK) {
+			printf("--- TC-R3 report ---\n");
+			printf("  baseline (1MB sections) : %u us\n", res.baseline_us);
+			printf("  split    (4KB L2 pages) : %u us\n", res.split_us);
+			printf("  overhead                : %u %%  (gate: <10%%)\n",
+			       res.overhead_pct);
+			printf("  one runtime split       : %u us\n", res.split_cost_us);
+			printf("  protect+restore pair    : %u us (incl. SGI4 syncs)\n",
+			       res.op_cost_us);
+			printf("  L2 tables used          : %u\n", res.sections_split);
+			if (res.overhead_pct < 10) {
+				printf(">>> R3 PASS: 4KB heap protection is affordable <<<\n");
+			} else {
+				printf(">>> R3 MITIGATION REQUIRED: overhead >= 10%% <<<\n");
+			}
+		} else {
+			printf("[mmu_protect_test] ioctl returned %d (errno %d)\n", ret, errno);
+		}
+
+		close(fd);
+		return ret;
+	}
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+	else if (strcmp(argv[1], "heap_protect") == 0) {
+		int phase = 3;
+
+		if (argc > 2) {
+			phase = argv[2][0] - '0';
+		}
+		if (phase < 1 || phase > 4) {
+			printf("[mmu_protect_test] heap_protect phase must be 1..4\n");
+			return ERROR;
+		}
+
+		printf("=== Heap UAF protection stress (R4), phase %d ===\n", phase);
+		if (phase == 4) {
+			printf("[mmu_protect_test] FATAL: step 4 writes to freed+protected memory\n");
+			printf("[mmu_protect_test] -> expect Data Abort + FAULT REPORT + PANIC.\n");
+		}
+
+		fd = open(OS_API_TEST_DRVPATH, O_RDWR);
+		if (fd < 0) {
+			printf("[mmu_protect_test] FAIL: cannot open %s (errno %d)\n",
+			       OS_API_TEST_DRVPATH, errno);
+			return ERROR;
+		}
+
+		ret = ioctl(fd, TESTIOC_MMU_HEAP_PROTECT_STRESS, (unsigned long)phase);
+
+		if (ret == OK) {
+			printf("[mmu_protect_test] phase %d completed (details in debug log)\n",
+			       phase);
+			if (phase == 4) {
+				printf("[mmu_protect_test] UNEXPECTED: no abort - not protected?\n");
+			}
+		} else {
+			printf("[mmu_protect_test] ioctl returned %d (errno %d)\n", ret, errno);
+		}
+
+		close(fd);
+		return ret;
+	}
+#endif /* CONFIG_MM_HEAP_UAF_PROTECT */
 #endif /* CONFIG_MMU_PAGE_PROTECT */
 	else {
 

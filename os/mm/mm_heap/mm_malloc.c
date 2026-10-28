@@ -210,6 +210,10 @@ retry_after_gc:
 		FAR struct mm_freenode_s *next;
 		size_t remaining;
 
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+		MM_UAF_PROTECT_BEFORE_USE(node);
+#endif
+
 #ifdef CONFIG_DEBUG_MM_UAF
 		mm_uaf_verify(node);
 #endif

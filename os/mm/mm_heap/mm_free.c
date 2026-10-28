@@ -196,11 +196,28 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
 	node->free_call_pid = free_call_pid;
 #endif
 
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+	/* R4: lock the freed chunk while it still has its ALLOCATED size.
+	 * After the merge below - and after the mm_addfreechunk() hook,
+	 * which is kept for split remainders and realloc - this node is a
+	 * coalesced free-run of many MB, always larger than
+	 * MM_UAF_PROTECT_MAX_SIZE, so protecting only there never locks a
+	 * single page (observed: ok=0 with 12702 frees).  Delayed frees
+	 * re-enter mm_free() through mm_free_delaylist() (mm_malloc.c:125)
+	 * and are covered by this same call.  Everything is a no-op until
+	 * the test driver arms the gate (mmu_set_uaf_protect_enabled()). */
+	MM_UAF_PROTECT_ON_FREE_HDR(node);
+#endif
+
 	/* Check if the following node is free and, if so, merge it */
 
 	next = (FAR struct mm_freenode_s *)((char *)node + node->size);
 	if ((next->preceding & MM_ALLOC_BIT) == 0) {
 		FAR struct mm_allocnode_s *andbeyond;
+
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+		MM_UAF_PROTECT_BEFORE_USE(next);
+#endif
 
 #ifdef CONFIG_DEBUG_MM_UAF
 		mm_uaf_verify(next);
@@ -232,6 +249,10 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
 
 	prev = (FAR struct mm_freenode_s *)((char *)node - node->preceding);
 	if ((prev->preceding & MM_ALLOC_BIT) == 0) {
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+		MM_UAF_PROTECT_BEFORE_USE(prev);
+#endif
+
 #ifdef CONFIG_DEBUG_MM_UAF
 		mm_uaf_verify(prev);
 #endif

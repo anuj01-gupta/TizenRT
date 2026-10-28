@@ -107,4 +107,11 @@ void mm_addfreechunk(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node)
 
 		next->blink = node;
 	}
+
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+	/* R4: every freed chunk reaches the free list through this
+	 * function, so locking the data area here covers free, merge,
+	 * split remainders and deferred-free paths uniformly. */
+	MM_UAF_PROTECT_ON_FREE(node);
+#endif
 }

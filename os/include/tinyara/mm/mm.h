@@ -666,6 +666,80 @@ void mm_uaf_poison(FAR struct mm_freenode_s *node);
 void mm_uaf_verify(FAR struct mm_freenode_s *node);
 #endif
 
+#if defined(CONFIG_MM_HEAP_UAF_PROTECT) && defined(CONFIG_DEBUG_MM_UAF)
+#error "CONFIG_MM_HEAP_UAF_PROTECT and CONFIG_DEBUG_MM_UAF are mutually exclusive: mm_free() locks the freed chunk before mm_addfreechunk() calls mm_uaf_poison(), which would write to an AP=0 page (Data Abort on the first free of a chunk >= 4KB)"
+#endif
+
+#if defined(CONFIG_MM_HEAP_UAF_PROTECT) && \
+    (defined(CONFIG_BUILD_FLAT) || defined(__KERNEL__))
+/* R4: MMU-enforced use-after-free protection for freed chunks (armv7-a).
+ *
+ * ON_FREE:      lock the FULL interior 4KB pages of the chunk data area
+ *               when the chunk joins the free list.  A chunk header is
+ *               never locked, and neither is any page shared with the
+ *               following chunk's header, so free-list linking and heap
+ *               traversal always stay fault-free.
+ * BEFORE_USE:   unlock the data area before the allocator (or the
+ *               caller) touches it.  Unlocking a chunk that was never
+ *               locked (size grew since, edge chunk, ...) is a no-op.
+ */
+#define MM_UAF_PROTECT_MIN_SIZE  4096	/* one HW page (MM_PGSIZE) */
+#define MM_UAF_PROTECT_MAX_SIZE  (128 * 1024)
+/* Chunks larger than MAX are region-init nodes or coalesced mega free-runs:
+ * protecting them would storm page-table updates at boot.  They are skipped
+ * and counted (g_protect_skipped), never silently. */
+
+int mmu_protect_range_no_access(uintptr_t vaddr, size_t len);
+int mmu_restore_range(uintptr_t vaddr, size_t len);
+
+#define MM_UAF_PROTECT_ON_FREE(node) \
+	do { \
+		FAR struct mm_freenode_s *_uafn = (FAR struct mm_freenode_s *)(node); \
+		if (_uafn->size >= MM_UAF_PROTECT_MIN_SIZE) { \
+			uintptr_t _data = (uintptr_t)_uafn + SIZEOF_MM_FREENODE; \
+			mmu_protect_range_no_access(_data, \
+						    _uafn->size - SIZEOF_MM_FREENODE); \
+		} \
+	} while (0)
+
+/* Variant for a chunk that is STILL an allocnode: mm_free() calls this
+ * before coalescing, while the node still has its allocated size.  After
+ * the merge the very same range is a coalesced free-run of many MB, which
+ * is always larger than MM_UAF_PROTECT_MAX_SIZE and gets skipped, so
+ * protecting only from mm_addfreechunk() never locks anything.  The header
+ * offset of an allocnode differs from that of a freenode, hence the
+ * separate macro. */
+#define MM_UAF_PROTECT_ON_FREE_HDR(node) \
+	do { \
+		FAR struct mm_allocnode_s *_uafn = (FAR struct mm_allocnode_s *)(node); \
+		if (_uafn->size >= MM_UAF_PROTECT_MIN_SIZE && \
+		    _uafn->size <= MM_UAF_PROTECT_MAX_SIZE) { \
+			uintptr_t _data = (uintptr_t)_uafn + SIZEOF_MM_ALLOCNODE; \
+			mmu_protect_range_no_access(_data, \
+						    _uafn->size - SIZEOF_MM_ALLOCNODE); \
+		} \
+	} while (0)
+
+#define MM_UAF_PROTECT_BEFORE_USE(node) \
+	do { \
+		FAR struct mm_freenode_s *_uafn = (FAR struct mm_freenode_s *)(node); \
+		if (_uafn->size >= MM_UAF_PROTECT_MIN_SIZE) { \
+			uintptr_t _data = (uintptr_t)_uafn + SIZEOF_MM_FREENODE; \
+			mmu_restore_range(_data, \
+					  _uafn->size - SIZEOF_MM_FREENODE); \
+		} \
+	} while (0)
+
+#elif defined(CONFIG_MM_HEAP_UAF_PROTECT)
+/* The user-space copy of mm_heap (libumm in the loadable binary) is not
+ * linked against the armv7-a MMU code; kernel-heap protection covers the
+ * kmm_ paths used by drivers and the TC-R4 stress test.  User-heap chunks
+ * are simply not MMU-protected: compile the hooks to no-ops there. */
+#define MM_UAF_PROTECT_ON_FREE(node)     do { } while (0)
+#define MM_UAF_PROTECT_ON_FREE_HDR(node) do { } while (0)
+#define MM_UAF_PROTECT_BEFORE_USE(node)  do { } while (0)
+#endif
+
 void mm_dump_node(struct mm_allocnode_s *node, char *node_type);
 void mm_dump_heap_region(uint32_t start, uint32_t end);
 void mm_dump_heap_free_node_list(struct mm_heap_s *heap);

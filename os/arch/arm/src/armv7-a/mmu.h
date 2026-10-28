@@ -1735,6 +1735,18 @@ void mmu_set_page_ro(uint32_t vaddr);
 
 #ifdef CONFIG_MMU_PAGE_PROTECT
 void mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte);
+
+/* R4: protect/unprotect every full 4KB page inside [vaddr, vaddr+len).
+ * Ragged edges untouched; headers never locked.  Sections are split to
+ * L2 first (bounded by the static L2 pool - on exhaustion the range is
+ * skipped, never corrupted).  Returns number of pages affected. */
+int mmu_protect_range_no_access(uintptr_t vaddr, size_t len);
+int mmu_restore_range(uintptr_t vaddr, size_t len);
+void mmu_set_uaf_protect_enabled(int on);
+
+/* R4 coverage counters (plan doc 11.1: coverage known, not assumed) */
+void mmu_protect_get_counters(uint32_t *ok, uint32_t *skipped,
+			      uint32_t *failed_budget);
 #endif
 
 #undef EXTERN
