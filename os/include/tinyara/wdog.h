@@ -59,6 +59,7 @@
 #include <tinyara/config.h>
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <sched.h>
 
 /****************************************************************************
@@ -190,6 +191,32 @@ int wd_gettime(WDOG_ID wdog);
 int wd_setwakeupsource(WDOG_ID wdog);
 clock_t wd_getwakeupdelay(void);
 #endif
+
+/* Watchdog MMU protection page (single 4KB page holding the free list, the
+ * active list, the free count and the pre-allocated pool).  Reads are always
+ * allowed; every write must be bracketed by wd_mmu_write_begin() /
+ * wd_mmu_write_end().  Available to the test driver and to the fault dump. */
+
+#ifdef CONFIG_WDOG_MMU_PROTECT
+int  wd_mmu_protect_init(void);
+int  wd_mmu_write_begin(void);
+int  wd_mmu_write_end(void);
+bool wd_mmu_is_protected(void);
+void wd_mmu_get_window_state(FAR bool *open, FAR uint8_t *cpu,
+                             FAR uint8_t *depth);
+#else
+#define wd_mmu_protect_init()                OK
+#define wd_mmu_write_begin()                 OK
+#define wd_mmu_write_end()                   OK
+#define wd_mmu_is_protected()                (false)
+#define wd_mmu_get_window_state(a, b, c)     do { *(a) = false; *(b) = 0; \
+                                                  *(c) = 0; } while (0)
+#endif
+
+/* Read-only view of the active watchdog list, so code outside the subsystem
+ * can inspect the queue while the protection page is read-only. */
+
+FAR struct sq_queue_s *wd_activelist(void);
 
 #undef EXTERN
 #ifdef __cplusplus

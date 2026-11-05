@@ -42,6 +42,7 @@
 #include <tinyara/config.h>
 
 #include <stdint.h>
+#include <errno.h>
 
 #include "cp15_cacheops.h"
 #include "barriers.h"
@@ -69,6 +70,14 @@ static int l2_idx = 0;
 #endif
 
 #ifdef CONFIG_MMU_PAGE_PROTECT
+
+/* Hardening: latched by any core that observes domain 0 as MANAGER, where
+ * the hardware ignores the AP bits and no permission fault can ever fire.
+ * mmu_domain_manager_seen() below is the query subsystems use to refuse
+ * installing protection that could not bite. */
+
+static volatile bool g_domain_manager_seen;
+
 #ifdef CONFIG_SMP
 
 /* Global variable to pass PTE address to SGI4 handler on other cores.
@@ -126,6 +135,7 @@ int mmu_tlb_flush_sgi_handler(int irq, void *context, void *arg)
 
 	/* CRITICAL CHECK: If domain 0 is MANAGER, AP bits are IGNORED! */
 	if ((dacr & 0x3) == 3) {
+		g_domain_manager_seen = true;
 		lldbg("SGI4: DOMAIN 0 IS MANAGER - AP BITS IGNORED!\n");
 	}
 
@@ -221,6 +231,56 @@ static inline void mmu_invalidate_tlb_bymva_is(uint32_t vaddr)
 	__asm__ volatile("mcr p15, 0, %0, c8, c7, 1" :: "r"(vaddr)); /* TLBIMVA — local */
 	ARM_DSB();
 	ARM_ISB();
+#endif
+}
+
+/* Invalidate one VA in the TLB of every core in the inner shareable
+ * domain, after making the new page-table entry visible in RAM.
+ *
+ * Hardware broadcast (TLBIMVAAIS) is used by default: it costs no
+ * interrupt and no spin-wait.  The SGI4 handshake above stays available
+ * through CONFIG_MMU_TLB_SYNC_HW_BROADCAST=n because it is the only
+ * option when the cluster does not broadcast TLBI ops; note that it is
+ * not re-entrant and that its handler flushes the peer's entire TLB.
+ *
+ * NOTE on the encoding: the inner shareable TLBI operations are
+ * op1=0, CRn=c8, CRm=c3, op2 = 0/1/2/3 - TLBIALLIS, TLBIMVAIS,
+ * TLBIASIDIS and TLBIMVAAIS.  CRm=c3 there is a selector field of the TLBI
+ * operation and has nothing to do with the domain register, which is
+ * CRn=c3 with op1=0; cp15.h (CP15_TLBIMVAAIS) and the helpers in mmu.h
+ * already use that encoding, and arm_head.S executes CP15_TLBIALLIS
+ * (c8, c3, 0) on every boot.  Writing CRm=c7 with op2=6 instead selects no
+ * operation at all, and an unallocated CP15 access takes an Undefined
+ * Instruction: that is what reset the board the first time the watchdog
+ * page was split, before wd_initialize() could report anything.
+ */
+static inline void mmu_flush_tlb_bymva_is(uint32_t vaddr)
+{
+	uint32_t *l1table = mmu_l1_pgtable_safe();
+	uint32_t l1_entry = l1table[vaddr >> 20];
+	uint32_t pte_addr;
+
+	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_PTE) {
+		uint32_t *l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
+		uint32_t l2_index = (vaddr & 0x000FF000) >> 12;
+
+		pte_addr = (uint32_t)&l2table[l2_index];
+	} else {
+		pte_addr = (uint32_t)&l1table[vaddr >> 20];
+	}
+
+	/* The page table walker reads RAM, not this core's data cache */
+	cp15_clean_dcache_bymva(pte_addr);
+	cp15_invalidate_dcacheline_bymva(pte_addr);
+	ARM_DSB();
+
+#ifdef CONFIG_MMU_TLB_SYNC_HW_BROADCAST
+	/* TLBIMVAAIS: invalidate by MVA, all ASIDs, inner shareable */
+	__asm__ volatile("mcr p15, 0, %0, c8, c3, 3" :: "r"(vaddr) : "memory");
+	ARM_DSB();
+	ARM_ISB();
+#else
+	mmu_invalidate_tlb_bymva_is(vaddr);
 #endif
 }
 #endif /* CONFIG_MMU_PAGE_PROTECT */
@@ -751,39 +811,109 @@ void mmu_dump_app_pgtbl(void)
  *
  ****************************************************************************/
 
+/* Pool of second-level page tables: one 1KB table per 1MB section that has
+ * been split.  A single shared table corrupts every previously split
+ * section when a second section overwrites it, hence one table per section.
+ * The pool size caps how many 1MB sections can ever be page-protected
+ * (24 tables = 24MB of protectable address space, 1KB of .bss each).
+ * Exhaustion is returned to the caller, never silent.  A table claimed for
+ * a region that is protected for the life of the system is tagged with its
+ * owner by mmu_protect_page_reserve() and is never released.
+ */
+
+#ifndef CONFIG_MMU_L2_POOL_TABLES
+#define CONFIG_MMU_L2_POOL_TABLES 24	/* boards without the knob keep today's size */
+#endif
+
+#define MMU_L2_POOL_NENTRIES CONFIG_MMU_L2_POOL_TABLES
+static uint32_t s_l2_pool[MMU_L2_POOL_NENTRIES][256] __attribute__((aligned(1024)));
+static int s_l2_pool_next;
+static const char *s_l2_pool_owner[MMU_L2_POOL_NENTRIES];
+
+/****************************************************************************
+ * Name: mmu_l2_pool_usage
+ *
+ * Description:
+ *   How many second-level page tables of the static pool have been claimed,
+ *   and how many the configuration allows.  A table is never released, so
+ *   the first number only grows.  The protection tests need it to tell "this
+ *   section was already split" from "the split was refused because the pool
+ *   is empty", which no log line distinguishes.
+ *
+ * Returned Value:
+ *   Tables claimed; *total, when given, receives the configured maximum.
+ *
+ ****************************************************************************/
+
+uint32_t mmu_l2_pool_usage(uint32_t *total)
+{
+	if (total != NULL) {
+		*total = (uint32_t)MMU_L2_POOL_NENTRIES;
+	}
+
+	return (uint32_t)s_l2_pool_next;
+}
+
+/****************************************************************************
+ * Name: mmu_l2_pool_held
+ *
+ * Description:
+ *   How many claimed tables belong to a region that is protected for the
+ *   life of the system.  mmu_protect_page_reserve() tags such a table with
+ *   its owner (s_l2_pool_owner[], written only there) and nothing ever
+ *   clears the tag, so the gap between this number and mmu_l2_pool_usage()
+ *   is the part of the pool that ad-hoc splits have eaten - the number that
+ *   says whether a soak run has left the board with less protectable space
+ *   than it started with.
+ *
+ * Returned Value:
+ *   Tables whose owner is known.
+ *
+ ****************************************************************************/
+
+uint32_t mmu_l2_pool_held(void)
+{
+	uint32_t n = 0;
+	int i;
+
+	for (i = 0; i < s_l2_pool_next; i++) {
+		if (s_l2_pool_owner[i] != NULL) {
+			n++;
+		}
+	}
+
+	return n;
+}
+
 #ifndef CONFIG_ARCH_ROMPGTABLE
-void mmu_split_section_to_l2(uint32_t vaddr)
+int mmu_split_section_to_l2(uint32_t vaddr)
 {
 	uint32_t section_addr = vaddr & ~((1 << SECTION_SHIFT) - 1);
 	uint32_t l1_entry = mmu_l1_getentry(section_addr);
 	uint32_t *l1table;
 	uint32_t l1_index;
 	uint32_t phys_base;
-	/* R6: static pool of L2 tables - one table per split section.
-	 * A single shared table (as before) corrupts every previously
-	 * split section when a second section overwrites it.  Pool size
-	 * caps how many 1MB sections can ever be page-protected:
-	 * 24 tables = 24MB protectable.  Exhaustion is visible (lldbg +
-	 * mmu_protect_get_counters failed_budget), never silent. */
-#define MMU_L2_POOL_NENTRIES 24
-	static uint32_t s_l2_pool[MMU_L2_POOL_NENTRIES][256] __attribute__((aligned(1024)));
-	static int s_l2_pool_next;
 	uint32_t *l2table;
 	int i;
 
-	/* Only split if currently mapped as a 1MB section */
-	if ((l1_entry & PMD_TYPE_MASK) != PMD_TYPE_SECT) {
-		/* Already an L2 page table or fault — nothing to do */
-		return;
+	/* Splitting is idempotent: a section that has already been split
+	 * keeps the table it was given the first time. */
+	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_PTE) {
+		return OK;
 	}
 
-	/* R6 guard: take the next free L2 table from the pool.  On
-	 * exhaustion, refuse to split (the caller must not fall back to
-	 * touching the section - that would block a whole 1MB). */
+	/* Nothing page-protectable behind a fault or a supersection */
+	if ((l1_entry & PMD_TYPE_MASK) != PMD_TYPE_SECT) {
+		return -EINVAL;
+	}
+
+	/* Take the next free L2 table from the pool.  On exhaustion, refuse
+	 * to split (the caller must not fall back to touching the section -
+	 * that would change the permissions of a whole 1MB). */
 	if (s_l2_pool_next >= MMU_L2_POOL_NENTRIES) {
 		lldbg("SPLIT: L2 pool EXHAUSTED (%d tables) - refusing to split 0x%08x\n",
 		      MMU_L2_POOL_NENTRIES, section_addr);
-		return;
+		return -ENOMEM;
 	}
 
 	l2table = s_l2_pool[s_l2_pool_next];
@@ -883,6 +1013,9 @@ void mmu_split_section_to_l2(uint32_t vaddr)
 		/* Preserve domain from original section entry */
 		new_l1 |= (l1_entry & PMD_SECT_DOM_MASK);
 
+		lldbg("SPLIT: L1[%d] desc 0x%08x -> table desc 0x%08x (table at 0x%08x)\n",
+		      l1_index, l1_entry, new_l1, new_l1 & PMD_PTE_PADDR_MASK);
+
 		l1table[l1_index] = new_l1;
 
 		/* Post-condition: silent unless the split failed */
@@ -925,15 +1058,75 @@ void mmu_split_section_to_l2(uint32_t vaddr)
 		}
 	}
 
-	/* Invalidate the entire TLB (not just by VA) to ensure no stale
-	 * section-mapping TLB entries remain.  The old L1 section entry
-	 * may have been cached in the TLB as a 1MB section mapping; after
-	 * replacing it with an L2 PTE, any stale TLB entry would cause the
-	 * MMU to use the old section attributes instead of the new L2
-	 * small page entries, leading to incorrect memory attributes.
+	/* Invalidate the mapping in every core's TLB.  The old L1 section
+	 * entry may still be cached as a 1MB section translation; a stale
+	 * entry would make the MMU keep using the section attributes
+	 * instead of the new L2 entries.  The invalidate must be broadcast:
+	 * the other core shares this page table, and if it kept the section
+	 * entry it would write the whole 1MB with the old permissions and
+	 * no fault would ever be raised there.
 	 */
-	cp15_invalidate_tlbs();
-	ARM_ISB();
+#ifdef CONFIG_MMU_TLB_SYNC_HW_BROADCAST
+	lldbg("SPLIT: section 0x%08x rebuilt as 256 pages, TLBIMVAAIS broadcast\n",
+	      section_addr);
+#elif defined(CONFIG_SMP)
+	lldbg("SPLIT: section 0x%08x rebuilt as 256 pages, SGI4 TLB handshake\n",
+	      section_addr);
+#else
+	lldbg("SPLIT: section 0x%08x rebuilt as 256 pages, local TLBIMVA (UP)\n",
+	      section_addr);
+#endif
+
+	mmu_flush_tlb_bymva_is(section_addr);
+
+	lldbg("SPLIT: section 0x%08x complete\n", section_addr);
+
+	return OK;
+}
+
+/****************************************************************************
+ * Name: mmu_protect_page_reserve
+ *
+ * Description:
+ *   Claim, and keep, the second-level page table that covers vaddr, for a
+ *   region that stays protected for the life of the system.  A caller that
+ *   can never release its table (the watchdog data page) must use this
+ *   rather than calling mmu_split_section_to_l2() alone, so the ownership
+ *   of every table in the pool is known and the budget is not spent twice.
+ *
+ * Returned Value:
+ *   OK, -ENOMEM if the L2 pool is exhausted, or -EINVAL if the address is
+ *   not mapped by a 1MB section or an existing L2 table.
+ *
+ ****************************************************************************/
+
+int mmu_protect_page_reserve(uint32_t vaddr, const char *owner)
+{
+	uint32_t section_addr = vaddr & ~((1 << SECTION_SHIFT) - 1);
+	uint32_t l1_entry;
+	uint32_t *l2table;
+	int status = mmu_split_section_to_l2(vaddr);
+	int i;
+
+	if (status != OK) {
+		return status;
+	}
+
+	l1_entry = mmu_l1_getentry(section_addr);
+	l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
+
+	for (i = 0; i < s_l2_pool_next; i++) {
+		if (s_l2_pool[i] == l2table) {
+			s_l2_pool_owner[i] = owner;
+			lldbg("RESERVE: L2 table %d held for '%s' (section 0x%08x)\n",
+			      i, owner ? owner : "?", section_addr);
+			return OK;
+		}
+	}
+
+	/* Split succeeded through a table that is not from this pool (an L2
+	 * mapping the platform installed itself): nothing to hold on to. */
+	return OK;
 }
 #endif
 
@@ -987,6 +1180,55 @@ uint32_t mmu_save_page_pte(uint32_t vaddr)
 #endif
 
 /****************************************************************************
+ * Name: mmu_get_page_pte_raw
+ *
+ * Description:
+ *   Read back the live second-level descriptor of a 4KB page, together with
+ *   its effective access permission, folded into *ap as
+ *   AP[1:0] | (AP2 << 1) - so 0..3 only, not the raw 3-bit field:
+ *   0 = no access, 1 = privileged read/write, 3 = privileged read-only
+ *   (observed on rtl8730e: 0x6013141e -> 1 writable, 0x6013161e -> 3
+ *   read-only).  Tests that only need "is it protected?" test bit 1, i.e.
+ *   AP2.  The raw AP2 bit is still visible in *pte (bit 9).
+ *   Used by the data abort report (was the page actually protected?) and by
+ *   the protection tests.  Only L2-mapped pages are described: an address
+ *   still covered by a 1MB section reports -EINVAL rather than pretending a
+ *   4KB permission exists for it.
+ *
+ * Returned Value:
+ *   OK, or -EINVAL when the address is not mapped through an L2 table.
+ *
+ ****************************************************************************/
+
+#ifndef CONFIG_ARCH_ROMPGTABLE
+int mmu_get_page_pte_raw(uint32_t vaddr, uint32_t *pte, uint8_t *ap)
+{
+	uint32_t page_addr = vaddr & ~SMALL_PAGE_MASK;
+	uint32_t l1_entry = mmu_l1_getentry(page_addr);
+	uint32_t *l2table;
+	uint32_t val;
+
+	if ((l1_entry & PMD_TYPE_MASK) != PMD_TYPE_PTE) {
+		return -EINVAL;
+	}
+
+	l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
+	val = l2table[(page_addr & 0x000FF000) >> 12];
+
+	if (pte != NULL) {
+		*pte = val;
+	}
+
+	if (ap != NULL) {
+		*ap = (uint8_t)(((val & PTE_AP_MASK) >> PTE_AP_SHIFT) |
+				((val & PTE_AP2) ? 2 : 0));
+	}
+
+	return OK;
+}
+#endif
+
+/****************************************************************************
  * Name: mmu_set_page_no_access
  *
  * Description:
@@ -1010,51 +1252,45 @@ uint32_t mmu_save_page_pte(uint32_t vaddr)
  ****************************************************************************/
 
 #ifndef CONFIG_ARCH_ROMPGTABLE
-void mmu_set_page_no_access(uint32_t vaddr)
+int mmu_set_page_no_access(uint32_t vaddr)
 {
 	uint32_t page_addr = vaddr & ~SMALL_PAGE_MASK;
 	uint32_t l1_entry = mmu_l1_getentry(page_addr);
+	uint32_t *l2table;
+	uint32_t l2_index;
 
-	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_SECT) {
-		/* 1MB section - modify the L1 entry directly */
-		uint32_t *l1table = mmu_l1_pgtable_safe();
-		uint32_t index = page_addr >> 20;
-
-		/* Clear ALL AP bits to 00 = No access at any privilege level.
-		 * Must clear AP[2] (bit 15, PMD_SECT_AP2) in addition to
-		 * AP[1:0] (bits 10-11, PMD_SECT_AP_MASK).  If AP[2] is left
-		 * set, the section becomes privileged read-only instead of
-		 * no-access, and read accesses would NOT fault. */
-		l1table[index] = (l1table[index] & ~PMD_SECT_AP_MASK & ~PMD_SECT_AP2) | PMD_SECT_AP_NONE;
-
-
-		cp15_clean_dcache_bymva((uint32_t)&l1table[index]);
-		mmu_invalidate_region(page_addr, SECTION_SIZE);
-		return;
+	if ((l1_entry & PMD_TYPE_MASK) != PMD_TYPE_PTE) {
+		/* Refuse to fall back to the 1MB section entry: that megabyte
+		 * is shared with other kernel data (and with the heap), and
+		 * making all of it No-Access faults code that has nothing to
+		 * do with this page - an abort inside the abort path. */
+		lldbg("SET_NO_ACCESS: 0x%08x is not 4KB-mapped - refused\n", page_addr);
+		return -EINVAL;
 	}
 
-	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_PTE) {
-		/* L1 points to an L2 page table */
-		uint32_t *l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
-		uint32_t l2_index = (page_addr & 0x000FF000) >> 12;
+	/* L1 points to an L2 page table */
+	l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
+	l2_index = (page_addr & 0x000FF000) >> 12;
 
-		/* Set AP=00 (No Access at any privilege level).
-		 * Must clear both AP[1:0] (bits 4-5, PTE_AP_MASK) and
-		 * AP[2] (bit 9, PTE_AP2).  If AP[2] is left set, the page
-		 * becomes privileged read-only instead of no-access, and
-		 * read accesses would NOT fault. */
-		l2table[l2_index] = (l2table[l2_index] & ~PTE_AP_MASK & ~PTE_AP2) | PTE_AP_NONE;
+	/* Set AP=00 (No Access at any privilege level).
+	 * Must clear both AP[1:0] (bits 4-5, PTE_AP_MASK) and
+	 * AP[2] (bit 9, PTE_AP2).  If AP[2] is left set, the page
+	 * becomes privileged read-only instead of no-access, and
+	 * read accesses would NOT fault. */
+	l2table[l2_index] = (l2table[l2_index] & ~PTE_AP_MASK & ~PTE_AP2) | PTE_AP_NONE;
 
-		cp15_clean_dcache_bymva((uint32_t)&l2table[l2_index]);
+	cp15_clean_dcache_bymva((uint32_t)&l2table[l2_index]);
 
-		/* Post-condition: silent unless AP really failed to clear */
-		if ((l2table[l2_index] & (PTE_AP_MASK | PTE_AP2)) != 0) {
-			lldbg("SET_NO_ACCESS: AP clear failed pte=0x%08x\n",
-			      l2table[l2_index]);
-		}
-
-		mmu_invalidate_tlb_bymva_is(page_addr);
+	/* Post-condition: the entry must really have changed */
+	if ((l2table[l2_index] & (PTE_AP_MASK | PTE_AP2)) != 0) {
+		lldbg("SET_NO_ACCESS: AP clear failed pte=0x%08x\n",
+		      l2table[l2_index]);
+		return -EIO;
 	}
+
+	mmu_flush_tlb_bymva_is(page_addr);
+
+	return OK;
 }
 #endif
 
@@ -1083,60 +1319,43 @@ void mmu_set_page_no_access(uint32_t vaddr)
  ****************************************************************************/
 
 #ifndef CONFIG_ARCH_ROMPGTABLE
-void mmu_set_page_ro(uint32_t vaddr)
+int mmu_set_page_ro(uint32_t vaddr)
 {
 	uint32_t page_addr = vaddr & ~SMALL_PAGE_MASK;
 	uint32_t l1_entry = mmu_l1_getentry(page_addr);
+	uint32_t *l2table;
+	uint32_t l2_index;
 
-	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_SECT) {
-		/* 1MB section - modify the L1 entry directly */
-		uint32_t *l1table = mmu_l1_pgtable_safe();
-		uint32_t index = page_addr >> 20;
-
-		/* Set AP to privileged read-only */
-		l1table[index] = (l1table[index] & ~PMD_SECT_AP_MASK) | PMD_SECT_AP_R1;
-
-		cp15_clean_dcache_bymva((uint32_t)&l1table[index]);
-		mmu_invalidate_region(page_addr, SECTION_SIZE);
-		return;
+	if ((l1_entry & PMD_TYPE_MASK) != PMD_TYPE_PTE) {
+		/* Refuse to fall back to the 1MB section entry: that megabyte
+		 * is shared with other kernel data (and with the heap), so
+		 * making it read-only would abort unrelated code - and would
+		 * report success while doing the wrong thing. */
+		lldbg("SET_RO: 0x%08x is not 4KB-mapped - refused\n", page_addr);
+		return -EINVAL;
 	}
 
-	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_PTE) {
-		/* L1 points to an L2 page table */
-		uint32_t *l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
-		uint32_t l2_index = (page_addr & 0x000FF000) >> 12;
-		uint32_t dacr;
+	/* L1 points to an L2 page table */
+	l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
+	l2_index = (page_addr & 0x000FF000) >> 12;
 
-		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr));
-		lldbg("SET_RO: CPU%d DACR=0x%08x (dom0=%s) l1_entry=0x%08x (dom=%d)\n",
-		      this_cpu(), dacr,
-		      (dacr & 0x3) == 0 ? "NO_ACCESS" :
-		      (dacr & 0x3) == 1 ? "CLIENT" :
-		      (dacr & 0x3) == 3 ? "MANAGER" : "RESERVED",
-		      l1_entry, (l1_entry >> 5) & 0xF);
-		lldbg("SET_RO: vaddr=0x%08x l2table=0x%08x l2_index=%d pte_addr=0x%08x\n",
-		      page_addr, (uint32_t)l2table, l2_index, (uint32_t)&l2table[l2_index]);
-		lldbg("SET_RO: PTE before=0x%08x (AP=0x%x AP2=%d type=0x%x)\n",
-		      l2table[l2_index], (l2table[l2_index] >> 4) & 3,
-		      (l2table[l2_index] >> 9) & 1, l2table[l2_index] & 3);
+	/* Set AP to privileged read-only (PTE_AP_R1).
+	 * Must clear both AP[1:0] (bits 4-5, PTE_AP_MASK) and
+	 * AP[2] (bit 9, PTE_AP2) before setting the new value,
+	 * because PTE_AP_R1 = PTE_AP_R12 = PTE_AP0 | PTE_AP2. */
+	l2table[l2_index] = (l2table[l2_index] & ~PTE_AP_MASK & ~PTE_AP2) | PTE_AP_R1;
 
+	cp15_clean_dcache_bymva((uint32_t)&l2table[l2_index]);
 
-		/* Set AP to privileged read-only (PTE_AP_R1).
-		 * Must clear both AP[1:0] (bits 4-5, PTE_AP_MASK) and
-		 * AP[2] (bit 9, PTE_AP2) before setting the new value,
-		 * because PTE_AP_R1 = PTE_AP_R12 = PTE_AP0 | PTE_AP2. */
-		l2table[l2_index] = (l2table[l2_index] & ~PTE_AP_MASK & ~PTE_AP2) | PTE_AP_R1;
-
-		lldbg("SET_RO: PTE after write=0x%08x (AP=0x%x type=0x%x)\n",
-		      l2table[l2_index], (l2table[l2_index] >> 4) & 3, l2table[l2_index] & 3);
-
-		cp15_clean_dcache_bymva((uint32_t)&l2table[l2_index]);
-
-		lldbg("SET_RO: PTE after clean=0x%08x (AP=0x%x type=0x%x)\n",
-		      l2table[l2_index], (l2table[l2_index] >> 4) & 3, l2table[l2_index] & 3);
-
-		mmu_invalidate_tlb_bymva_is(page_addr);
+	/* Post-condition: the entry must really have changed */
+	if ((l2table[l2_index] & (PTE_AP_MASK | PTE_AP2)) != PTE_AP_R1) {
+		lldbg("SET_RO: AP set failed pte=0x%08x\n", l2table[l2_index]);
+		return -EIO;
 	}
+
+	mmu_flush_tlb_bymva_is(page_addr);
+
+	return OK;
 }
 #endif
 
@@ -1163,34 +1382,43 @@ void mmu_set_page_ro(uint32_t vaddr)
  ****************************************************************************/
 
 #ifndef CONFIG_ARCH_ROMPGTABLE
-void mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte)
+int mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte)
 {
 	uint32_t page_addr = vaddr & ~SMALL_PAGE_MASK;
 	uint32_t l1_entry = mmu_l1_getentry(page_addr);
+	uint32_t *l2table;
+	uint32_t l2_index;
 
-	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_SECT) {
-		/* 1MB section - restore the L1 entry directly */
-		uint32_t *l1table = mmu_l1_pgtable_safe();
-		uint32_t index = page_addr >> 20;
-
-		l1table[index] = saved_pte;
-
-		cp15_clean_dcache_bymva((uint32_t)&l1table[index]);
-		mmu_invalidate_region(page_addr, SECTION_SIZE);
-		return;
+	if (saved_pte == 0) {
+		lldbg("RESTORE: refusing to write a null descriptor for 0x%08x\n", page_addr);
+		return -EINVAL;
 	}
 
-	if ((l1_entry & PMD_TYPE_MASK) == PMD_TYPE_PTE) {
-		/* L1 points to an L2 page table */
-		uint32_t *l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
-		uint32_t l2_index = (page_addr & 0x000FF000) >> 12;
-
-		/* Restore the original PTE (with original R/W permissions) */
-		l2table[l2_index] = saved_pte;
-
-		cp15_clean_dcache_bymva((uint32_t)&l2table[l2_index]);
-		mmu_invalidate_tlb_bymva_is(page_addr);
+	if ((l1_entry & PMD_TYPE_MASK) != PMD_TYPE_PTE) {
+		/* Same rule as mmu_set_page_ro(): a saved 1MB descriptor must
+		 * not be written back into the L1 table by this function. */
+		lldbg("RESTORE: 0x%08x is not 4KB-mapped - refused\n", page_addr);
+		return -EINVAL;
 	}
+
+	/* L1 points to an L2 page table */
+	l2table = (uint32_t *)(l1_entry & PMD_PTE_PADDR_MASK);
+	l2_index = (page_addr & 0x000FF000) >> 12;
+
+	/* Restore the original PTE (with its original R/W permissions) */
+	l2table[l2_index] = saved_pte;
+
+	cp15_clean_dcache_bymva((uint32_t)&l2table[l2_index]);
+
+	if (l2table[l2_index] != saved_pte) {
+		lldbg("RESTORE: pte write failed 0x%08x!=0x%08x\n",
+		      l2table[l2_index], saved_pte);
+		return -EIO;
+	}
+
+	mmu_flush_tlb_bymva_is(page_addr);
+
+	return OK;
 }
 #endif
 
@@ -1265,6 +1493,7 @@ int mmu_protect_range_no_access(uintptr_t vaddr, size_t len)
 	uintptr_t page;
 	irqstate_t flags;
 	int protected_pages = 0;
+	int budget_failed = 0;	/* R6: refuse was a budget failure, not a skip */
 
 	if (!g_protect_enabled) {
 		return 0;		/* boot-safe: no page-table touch, no SGI4 */
@@ -1292,6 +1521,7 @@ int mmu_protect_range_no_access(uintptr_t vaddr, size_t len)
 				/* Pool exhausted - fail-safe: skip, never
 				 * touch the section entry. */
 				g_protect_failed_budget++;
+				budget_failed = 1;
 				break;
 			}
 		}
@@ -1313,6 +1543,7 @@ int mmu_protect_range_no_access(uintptr_t vaddr, size_t len)
 		if (g_protect_saved_count >= MM_PROTECT_SAVED_MAX) {
 			leave_critical_section(flags);
 			g_protect_failed_budget++;
+			budget_failed = 1;
 			break;
 		}
 
@@ -1330,6 +1561,14 @@ int mmu_protect_range_no_access(uintptr_t vaddr, size_t len)
 		g_protect_ok++;
 	} else {
 		g_protect_skipped++;
+		if (budget_failed) {
+			/* A budget refusal is not a benign skip: the
+			 * MMU_L2_POOL_TABLES help has always promised
+			 * -ENOMEM on exhaustion.  Report it so the
+			 * allocator hook can make the un-wrapped chunk
+			 * visible instead of silently writable. */
+			return -ENOMEM;
+		}
 	}
 
 	return protected_pages;
@@ -1420,5 +1659,110 @@ void mmu_protect_get_counters(uint32_t *ok, uint32_t *skipped,
 	if (failed_budget) {
 		*failed_budget = g_protect_failed_budget;
 	}
+}
+
+/****************************************************************************
+ * Name: mmu_domain_manager_seen
+ *
+ * Description:
+ *   Hardening query (tinyara/mmu.h): would AP-bit protection be vacuous
+ *   right now?  The SGI4 path latches the flag on the core that sees a
+ *   MANAGER domain; the DACR is read here as well because the hardware-
+ *   broadcast TLB configuration never runs the SGI handler, so the latched
+ *   flag alone would stay false on that path.
+ *
+ * Returned Value:
+ *   true if domain 0 is (or was ever) MANAGER on this core.
+ *
+ ****************************************************************************/
+
+bool mmu_domain_manager_seen(void)
+{
+	uint32_t dacr;
+
+	if (g_domain_manager_seen) {
+		return true;
+	}
+
+	__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr));
+	return ((dacr & 0x3) == 3);
+}
+
+/****************************************************************************
+ * Name: mmu_protect_range_max
+ *
+ * Description:
+ *   Largest range mmu_protect_range_no_access() accepts.  The allocator hook
+ *   in tinyara/mm/mm.h asks for this instead of keeping its own copy of the
+ *   number: two definitions of one limit drift apart silently, and the only
+ *   symptom is the "skipped" coverage counter growing while everything still
+ *   reports OK.
+ *
+ * Returned Value:
+ *   Maximum range length in bytes.
+ *
+ ****************************************************************************/
+
+size_t mmu_protect_range_max(void)
+{
+	return (size_t)MM_PROTECT_RANGE_MAX;
+}
+
+/****************************************************************************
+ * Name: mmu_protect_saved_usage
+ *
+ * Description:
+ *   How many pages are currently taken out of the save table
+ *   (g_protect_saved[]).  This, not the L2 pool, is what bounds how much
+ *   memory can be No-Access at one time: MM_PROTECT_SAVED_MAX pages of 4 KB
+ *   each.  Reporting only the pool makes the first failed_budget increment
+ *   look like a defect instead of a ceiling that was reached.
+ *
+ * Input Parameters:
+ *   max - optional, receives the configured ceiling.
+ *
+ * Returned Value:
+ *   Pages currently saved, i.e. currently locked.
+ *
+ ****************************************************************************/
+
+uint32_t mmu_protect_saved_usage(uint32_t *max)
+{
+	if (max != NULL) {
+		*max = (uint32_t)MM_PROTECT_SAVED_MAX;
+	}
+
+	return (uint32_t)g_protect_saved_count;
+}
+
+/****************************************************************************
+ * Name: mmu_range_is_no_access
+ *
+ * Description:
+ *   Does the page containing vaddr carry an AP=0 descriptor right now?  Pure
+ *   read: no attribute change, no invalidation, abort-context harmless.
+ *   Diagnostic code that dumps memory - the heap node dump reached from a
+ *   use-after-free report - has to ask this before dereferencing, or the
+ *   reporter faults inside the very fault it is trying to explain.
+ *
+ * Input Parameters:
+ *   vaddr - Any virtual address inside the page to test.
+ *
+ * Returned Value:
+ *   true when the page is mapped and No-Access; false when it is readable or
+ *   is not covered by a 4KB descriptor at all.
+ *
+ ****************************************************************************/
+
+bool mmu_range_is_no_access(uintptr_t vaddr)
+{
+	uint32_t pte;
+	uint8_t ap = 0;
+
+	if (mmu_get_page_pte_raw((uint32_t)vaddr, &pte, &ap) != OK) {
+		return false;
+	}
+
+	return ap == 0;
 }
 #endif	/* CONFIG_MMU_PAGE_PROTECT && !CONFIG_ARCH_ROMPGTABLE */

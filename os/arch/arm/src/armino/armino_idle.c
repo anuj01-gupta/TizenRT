@@ -80,7 +80,7 @@ typedef int                                bk_err_t;      /**< Return error code
 
 /*=====================VARIABLE SECTION START==================*/
 clock_t s_missed_ticks = 0;
-extern sq_queue_t g_wdactivelist;
+extern FAR struct sq_queue_s *wd_activelist(void);
 /*=====================VARIABLE SECTION END====================*/
 
 /*================FUNCTION DECLARATION SECTION START===========*/
@@ -147,7 +147,7 @@ static bool up_check_valid_wakeup(void)
 	bool has_valid_wakeup         = false;
 	struct wdog_s *curr           = NULL;
 
-	for (curr = (FAR struct wdog_s *)g_wdactivelist.head; curr; curr = curr->next) {
+	for (curr = (FAR struct wdog_s *)wd_activelist()->head; curr; curr = curr->next) {
 		if (WDOG_ISWAKEUP(curr)) {
 			has_valid_wakeup = true;
 			break;

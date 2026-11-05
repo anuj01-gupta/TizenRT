@@ -42,6 +42,7 @@
 #include <tinyara/config.h>
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <assert.h>
 #include <debug.h>
 
@@ -64,6 +65,9 @@
 #endif
 #ifdef CONFIG_MMU_FAULT_REPORT
 #include <tinyara/mmu.h>
+#ifdef CONFIG_WDOG_MMU_PROTECT
+#include <tinyara/wdog.h>	/* wd_mmu_get_window_state() for the fault report */
+#endif
 #endif
 
 /****************************************************************************
@@ -168,11 +172,12 @@ static inline void print_mmu_fault_report(uint32_t *regs, uint32_t dfar,
 
 	lldbg_noarg("\n");
 	lldbg("MMU DATA ABORT REPORT\n");
-	lldbg("  CPU%u ", (unsigned int)up_cpu_index());
 	if (tcb != NULL) {
-		lldbg("pid=%d task=%s\n", (int)tcb->pid, task_name);
+		lldbg("  CPU%u pid=%d task=%s\n",
+		      (unsigned int)up_cpu_index(), (int)tcb->pid, task_name);
 	} else {
-		lldbg("pid=? task=%s\n", task_name);
+		lldbg("  CPU%u pid=? task=%s\n",
+		      (unsigned int)up_cpu_index(), task_name);
 	}
 
 	lldbg("  PC=0x%08x DFAR=0x%08x access=%s\n", regs[REG_PC], dfar,
@@ -181,9 +186,50 @@ static inline void print_mmu_fault_report(uint32_t *regs, uint32_t dfar,
 	      mmu_fault_status_str(fs),
 	      (unsigned long)((dfsr & DFSR_DOMAIN_MASK) >> DFSR_DOMAIN_SHIFT));
 
+#ifdef CONFIG_MMU_PAGE_PROTECT
+	/* The permission the page actually has.  This is what separates a
+	 * caught corruption (AP already read-only: someone outside the
+	 * subsystem wrote into protected data) from a self-inflicted fault
+	 * (AP read-write: the fault happened while a write window was open,
+	 * or the protection was never applied).
+	 */
+	{
+		uint32_t fpte = 0;
+		uint8_t fap = 0xff;
+
+		if (mmu_get_page_pte_raw(dfar, &fpte, &fap) == OK) {
+			lldbg("  PTE=0x%08x AP=%u (%s)\n", fpte, (unsigned int)fap,
+			      fap == 0 ? "NO ACCESS" :
+			      (fap & 2) ? "READ-ONLY" : "READ-WRITE");
+		} else {
+			lldbg("  PTE=n/a (DFAR not 4KB-mapped)\n");
+		}
+	}
+#endif
+
+#ifdef CONFIG_WDOG_MMU_PROTECT
+	{
+		bool wd_open = false;
+		uint8_t wd_cpu = 0xff;
+		uint8_t wd_depth = 0;
+
+		wd_mmu_get_window_state(&wd_open, &wd_cpu, &wd_depth);
+		lldbg("  wdog write window=%s cpu%u depth%u\n",
+		      wd_open ? "OPEN" : "closed",
+		      (unsigned int)wd_cpu, (unsigned int)wd_depth);
+	}
+#endif
+
 	if (region_name != NULL) {
-		lldbg("  >>> PROTECTED REGION HIT: '%s' (0x%08x, %u bytes) <<<\n",
-		      region_name, (unsigned int)dfar, (unsigned int)region_size);
+		if (region_size != 0 && (region_size & (region_size - 1)) == 0) {
+			lldbg("  >>> PROTECTED REGION HIT: '%s' region=0x%08x+0x%x DFAR=0x%08x <<<\n",
+			      region_name,
+			      (unsigned int)(dfar & ~((uintptr_t)region_size - 1)),
+			      (unsigned int)region_size, (unsigned int)dfar);
+		} else {
+			lldbg("  >>> PROTECTED REGION HIT: '%s' size=0x%x DFAR=0x%08x <<<\n",
+			      region_name, (unsigned int)region_size, (unsigned int)dfar);
+		}
 	} else {
 		lldbg("  no registered protected region contains DFAR\n");
 	}

@@ -287,6 +287,20 @@ SECTIONS
 		*(.bss)
 		*(.bss.*)
 		*(COMMON)
+
+		/* Watchdog data page (os/kernel/wdog): the watchdog pool, both
+		 * list heads and the free counter, alone in one 4KB page.  The
+		 * watchdog MMU protection flips the access permissions of the
+		 * single second-level descriptor that covers it, so nothing
+		 * else may share the page: hence the 4KB alignment before it
+		 * and the ASSERT on its size below.
+		 */
+		. = ALIGN(4096);
+		_wdog_data_start = ABSOLUTE(.);
+		*(.wdog_data)
+		_wdog_data_end = ABSOLUTE(.);
+		. = ALIGN(4096);
+
 		__bss_end__ = .;
 	} > CA32_BL3_DRAM_NS
 
@@ -328,24 +342,6 @@ SECTIONS
 		_psram_heap_start = ABSOLUTE(.);
 	} > CA32_BL3_DRAM_NS
 
-	/* Watchdog pool — placed at a 1MB-aligned address that does NOT overlap
-	 * with the FIP DRAM region (0x60200000-0x60400000).  The FIP contains
-	 * BL2+BL32+BL33 secure monitor code, and setting its L1 section to
-	 * Read-Only would break secure monitor operations.
-	 *
-	 * We place .wdog_pool at 0x60400000 (just after the FIP region) so it
-	 * has its own 1MB L1 section.  The watchdog MMU protection modifies
-	 * the L1 section entry's AP bits directly (no L2 split). */
-	.wdog_pool 0x60400000 (NOLOAD):
-	{
-		__wdog_pool_start__ = .;
-		*(.wdog_pool)
-		. = ALIGN(0x100000);
-		__wdog_pool_end__ = .;
-	} > CA32_BL3_DRAM_NS
-
-
-
 	.bluetooth_trace.text :
 
 	{
@@ -373,5 +369,28 @@ SECTIONS
 ASSERT(__flash_text_start__ == ORIGIN(CA32_IMG2_XIP), "__flash_text_start__ is changed.")
 ASSERT((__dram_text_start__ & 4095) == 0, "__dram_text_start__ is not 4KB aligned.")
 ASSERT((__dram_text_end__ & 4095) == 0, "__dram_text_end__ is not 4KB aligned.")
-/* Heap size excludes the 1MB-aligned .wdog_pool section placed after .psram_heap.start */
-__psram_heap_buffer_size__ = __wdog_pool_start__ - __psram_heap_buffer_start__;
+/* Two allocators share CA32_BL3_DRAM_NS and must never be given the same
+ * memory:
+ *
+ *   [ __psram_heap_buffer_start__ .. __ext_heap_end__ )  extended / user heap
+ *   [ __kheap_base__              .. KREGION_END      )  kernel heap
+ *
+ * __ext_heap_end__ is the top of the FIP (BL2+BL32+BL33) DRAM region and
+ * __kheap_base__ is one section above it, which is the partition every
+ * rtl8730e configuration has always used.  up_allocate_kheap() raises the
+ * kernel heap to __kheap_base__; letting the kernel heap start right after
+ * .bss would hand the extended heap to two allocators at once.
+ *
+ * The watchdog data page needs nothing carved out of the heap for it: it
+ * lives in .bss, below both heaps (asserted below).
+ */
+__ext_heap_end__ = ABSOLUTE(ORIGIN(CA32_FIP_DRAM_NS) + LENGTH(CA32_FIP_DRAM_NS));
+__kheap_base__ = ABSOLUTE(__ext_heap_end__ + 0x100000);
+__psram_heap_buffer_size__ = __ext_heap_end__ - __psram_heap_buffer_start__;
+ASSERT(__psram_heap_buffer_size__ > 0, "extended heap does not fit below the FIP region")
+ASSERT(__kheap_base__ < __PsramStackLimit, "kernel heap base is outside the DRAM region")
+
+/* The watchdog MMU protection flips the second-level descriptor of one 4KB
+ * page; everything the watchdog keeps in RAM has to stay inside it (the
+ * .wdog_data output section above, and struct wdog_data_s). */
+ASSERT((_wdog_data_end - _wdog_data_start) <= 4096, "watchdog data does not fit in one 4KB page")

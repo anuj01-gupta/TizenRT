@@ -58,6 +58,7 @@
 
 #include <stdbool.h>
 #include <assert.h>
+#include <errno.h>
 
 #include <tinyara/arch.h>
 #include <tinyara/wdog.h>
@@ -124,7 +125,17 @@ int wd_cancel(WDOG_ID wdog)
 	 */
 
 	if (wdog && WDOG_ISACTIVE(wdog)) {
-		wd_mmu_write_begin();	/* Allow writes to wdog protected page */
+		/* L2 descriptor for the watchdog page -> RW.  Making the page
+		 * writable can fail, and without the window every list operation
+		 * below would fault: leave the timer queued, with its lag and
+		 * its links untouched, and report that the cancellation did not
+		 * happen.
+		 */
+
+		if (wd_mmu_write_begin() != OK) {
+			leave_critical_section(state);
+			return -EIO;
+		}
 
 		/* Search the g_wdactivelist for the target FCB.  We can't use sq_rem
 		 * to do this because there are additional operations that need to be

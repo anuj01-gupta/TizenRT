@@ -65,158 +65,12 @@
 
 #ifdef CONFIG_WDOG_MMU_PROTECT
 #include <tinyara/irq.h>
-#include <tinyara/mmu.h>
-#ifdef CONFIG_SMP
-#include <tinyara/spinlock.h>
 #endif
 
-/* MMU Page Table Entry macros for L2 (Short Descriptor format) */
-#define PTE_AP_SHIFT         (4)
-#define PTE_AP_MASK          (3 << PTE_AP_SHIFT)
-#define PTE_AP(n)            ((n) << PTE_AP_SHIFT)
-
-/* MMU Page Table constants for ARMv7-A (Short Descriptor format)
- *
- * This implementation uses the Domain Access Control Register (DACR) to switch
- * the watchdog pool between Read-Only and Read-Write — NO TLB invalidation needed.
- *
- * The wdog pool's L1 section is assigned to domain 1 with AP bits set to RO.
- * The DACR controls whether domain 1's AP bits are enforced:
- *   - Domain 1 = client (01): AP bits enforced → Read-Only
- *   - Domain 1 = manager (11): AP bits ignored → Read-Write
- *
- * The DACR is checked on every memory access (not cached in TLB), so changing
- * it takes effect immediately with just one mcr instruction.
- *
- * FIXES (v1.2):
- *   1. Read-modify-write DACR — only modify Domain 1 bits, preserve all other
- *      domains (fixes Defect #7: DACR clobbers other domains).
- *   2. Add dsb + isb after mcr to DACR — ensures the write completes before
- *      any wdog data access (fixes Defect #3: missing DSB on out-of-order cores).
- *   3. Disable interrupts during begin/end — prevents timer tick from firing
- *      between DACR write and wdog access (fixes timer tick race condition).
- *   4. Per-core nesting counter for SMP — each core updates its own DACR.
- *      No spinlock needed — DACR is per-core. Shared wdog data structures
- *      are protected by enter_critical_section() which acquires g_cpu_irqlock
- *      on SMP, serializing access across cores.
- *      (fixes Defect #1: SMP DACR per-core).
- *
- * L1 Section fields:
- *   AP[1:0] = bits [11:10] (PMD_SECT_AP_SHIFT = 10)
- *   AP2     = bit 15       (PMD_SECT_AP2)
- *   Domain  = bits [8:5]   (PMD_SECT_DOMAIN_SHIFT = 5)
- *
- * DACR Domain 1 bit positions:
- *   Domain 1 = bits [3:2] of DACR (WDOG_DOMAIN * 2 = 2)
- *   Client  = 01 (RO), Manager = 11 (RW)
+/* The permission mechanism itself lives in wd_mmu_protect.c: it flips the
+ * AP bits of the one L2 descriptor that covers the watchdog data page.
  */
-#define PMD_SECT_AP2            (1 << 15)	/* Access Permission extension bit */
-#define PMD_SECT_AP_SHIFT       10			/* AP[1:0] at bits [11:10] */
-#define PMD_SECT_DOMAIN_SHIFT   5			/* Domain at bits [8:5] */
-#define WDOG_DOMAIN             1			/* Domain 1 for wdog pool */
-#define WDOG_DOMAIN_SHIFT       (WDOG_DOMAIN * 2)  /* Domain 1 = bits [3:2] */
-#define WDOG_DOMAIN_MASK        (0x3 << WDOG_DOMAIN_SHIFT)
 
-/* DACR Domain 1 values */
-#define DACR_DOMAIN1_CLIENT     (0x1 << WDOG_DOMAIN_SHIFT)  /* Client  = RO */
-#define DACR_DOMAIN1_MANAGER    (0x3 << WDOG_DOMAIN_SHIFT)  /* Manager = RW */
-
-/* External function to get page table base */
-extern uint32_t *mmu_get_os_l1_pgtbl(void);
-#define PGTABLE_BASE_VADDR  ((uint32_t)mmu_get_os_l1_pgtbl())
-
-/* Read Domain Access Control Register (DACR) */
-static inline uint32_t cp15_read_dacr(void)
-{
-	uint32_t val;
-	__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(val));
-	return val;
-}
-
-/* Set Domain 1 to Client (RO) via read-modify-write.
- * Preserves all other domains — fixes Defect #7.
- * Adds dsb + isb — fixes Defect #3.
- *
- * SMP FIX (v1.3): Use a memory-mapped shadow variable updated atomically
- * via ldrex/strex to prevent the read-modify-write race on the DACR.
- * The CP15 DACR is per-CPU, but the shadow is shared. The ldrex/strex
- * ensures the read-modify-write on the shadow is atomic across cores.
- * The final CP15 write is per-core (each core writes its own DACR).
- *
- * DEBUG: Log if domain 0 (kernel text) is ever clobbered.
- */
-static volatile uint32_t g_dacr_shadow = 0x00000005;  /* Dom0=Client, Dom1=Client */
-
-/* Debug counter to limit WDBG output — only print first few cycles */
-#ifdef CONFIG_WDOG_MMU_DACR_DEBUG
-static volatile int g_wdbg_count = 0;
-#define WDBG_MAX_PRINTS  10
-#endif
-
-
-static inline void cp15_set_dacr_domain1_client(void)
-{
-	uint32_t old_val;
-	uint32_t new_val;
-	uint32_t result;
-
-	/* Atomically update the shadow variable via ldrex/strex */
-	do {
-		__asm__ volatile("ldrex %0, [%1]" : "=r"(old_val) : "r"(&g_dacr_shadow));
-		new_val = (old_val & ~WDOG_DOMAIN_MASK) | DACR_DOMAIN1_CLIENT;
-		__asm__ volatile("strex %0, %1, [%2]" : "=&r"(result) : "r"(new_val), "r"(&g_dacr_shadow));
-	} while (result != 0);
-
-	/* Write the atomically-computed value to this core's DACR */
-	__asm__ volatile("mcr p15, 0, %0, c3, c0, 0" :: "r"(new_val) : "memory");
-	__asm__ volatile("dsb" ::: "memory");
-	__asm__ volatile("isb" ::: "memory");
-
-#ifdef CONFIG_WDOG_MMU_DACR_DEBUG
-	/* Verify domain 0 was not clobbered */
-	{
-		uint32_t dacr_after;
-		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr_after));
-		if ((dacr_after & 0x3) == 0) {
-			lldbg("DACR ALERT (client): dom0=NoAccess! dacr=0x%08x cpu=%d\n",
-			      dacr_after, up_cpu_index());
-		}
-	}
-#endif
-}
-
-static inline void cp15_set_dacr_domain1_manager(void)
-{
-	uint32_t old_val;
-	uint32_t new_val;
-	uint32_t result;
-
-	/* Atomically update the shadow variable via ldrex/strex */
-	do {
-		__asm__ volatile("ldrex %0, [%1]" : "=r"(old_val) : "r"(&g_dacr_shadow));
-		new_val = (old_val & ~WDOG_DOMAIN_MASK) | DACR_DOMAIN1_MANAGER;
-		__asm__ volatile("strex %0, %1, [%2]" : "=&r"(result) : "r"(new_val), "r"(&g_dacr_shadow));
-	} while (result != 0);
-
-	/* Write the atomically-computed value to this core's DACR */
-	__asm__ volatile("mcr p15, 0, %0, c3, c0, 0" :: "r"(new_val) : "memory");
-	__asm__ volatile("dsb" ::: "memory");
-	__asm__ volatile("isb" ::: "memory");
-
-#ifdef CONFIG_WDOG_MMU_DACR_DEBUG
-	/* Verify domain 0 was not clobbered */
-	{
-		uint32_t dacr_after;
-		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr_after));
-		if ((dacr_after & 0x3) == 0) {
-			lldbg("DACR ALERT (manager): dom0=NoAccess! dacr=0x%08x cpu=%d\n",
-			      dacr_after, up_cpu_index());
-		}
-	}
-#endif
-}
-
-#endif /* CONFIG_WDOG_MMU_PROTECT */
 
 
 
@@ -233,285 +87,37 @@ static inline void cp15_set_dacr_domain1_manager(void)
  * Public Variables
  ************************************************************************/
 
-/* Watchdog data variables.
+/* All watchdog globals live in one object so that, when
+ * CONFIG_WDOG_MMU_PROTECT is enabled, a single L2 descriptor covers every
+ * one of them: the pool, both list heads and the free count share one 4KB
+ * page of the .wdog_data section (the linker script ASSERTs that it fits).
  *
- * g_wdpool is the pre-allocated watchdog array.  When CONFIG_WDOG_MMU_PROTECT
- * is enabled, g_wdpool is placed in a separate .wdog_pool linker section
- * (1MB-aligned, in its own L1 section) so it can be individually protected
- * via L1 section AP bit manipulation — no L2 split needed.
+ * wdog/wdog.h aliases g_wdpool / g_wdfreelist / g_wdactivelist / g_wdnfree
+ * to the members below, so the rest of the subsystem is unchanged.
  */
 
-sq_queue_t g_wdfreelist;
-sq_queue_t g_wdactivelist;
-uint16_t g_wdnfree;
-
 #ifdef CONFIG_WDOG_MMU_PROTECT
-struct wdog_s g_wdpool[CONFIG_PREALLOC_WDOGS]
-	__attribute__((aligned(4096), section(".wdog_pool")));
+struct wdog_data_s g_wdog_data
+	__attribute__((aligned(4096), section(".wdog_data")));
 #else
-struct wdog_s g_wdpool[CONFIG_PREALLOC_WDOGS];
+struct wdog_data_s g_wdog_data;
 #endif
 
 /************************************************************************
  * Private Functions
  ************************************************************************/
 
-#ifdef CONFIG_WDOG_MMU_PROTECT
-
-/************************************************************************
- * MMU Permission Control for Watchdog Pool
- ************************************************************************/
-
-/* Base address of the watchdog pool */
-static uintptr_t g_wdog_pool_vaddr;
-
-/* Original L1 section entry for the watchdog pool region (saved at init) */
-static uint32_t g_wdog_pool_l1_saved;
-
-/* Flag indicating if the watchdog pool is currently read-only */
-static bool g_wdog_pool_is_ro = false;
-
-/* Flag indicating if MMU permission control is initialized */
-static bool g_wdog_mmu_initialized = false;
-
-/* Nesting counter for reentrant wd_mmu_write_begin/end calls.
- *
- * On SMP, each core has its own nesting counter. No spinlock is needed —
- * the DACR is per-core, so each core independently switches its own DACR.
- * Shared wdog data structures are protected by enter_critical_section()
- * (g_cpu_irqlock on SMP).
- * On single-core, a simple counter suffices.
+/* The watchdog MMU permission mechanism - the write window, the descriptor
+ * flip and the TLB broadcast - lives in wd_mmu_protect.c.
  */
-#ifdef CONFIG_SMP
-static volatile int g_wdog_mmu_nest_count[CONFIG_SMP_NCPUS];
-#else
-static int g_wdog_mmu_nest_count = 0;
-#endif
-
-
-/************************************************************************
- * Name: wd_mmu_protect_init
- *
- * Description:
- *   Initialize watchdog MMU protection using DACR approach.
- *   
- *   DACR approach:
- *   - Set DACR Domain 1 = Client (RO) to protect wdog pool
- *   - wd_mmu_write_begin() sets Domain 1 = Manager (RW) for writes
- *   - wd_mmu_write_end() sets Domain 1 = Client (RO) after writes
- *   - NO L2 page table manipulation needed
- *   - NO split needed (~100 cycles vs ~600+ with L2 approach)
- ************************************************************************/
-void wd_mmu_protect_init(void)
-{
-	uint32_t *l1table;
-	uint32_t index;
-	uint32_t ro_entry;
-	uintptr_t wdog_pool_vaddr;
-
-	if (g_wdog_mmu_initialized) {
-		return;
-	}
-
-	/* Get L1 page table entry */
-	l1table = (uint32_t *)PGTABLE_BASE_VADDR;
-	wdog_pool_vaddr = (uintptr_t)&g_wdpool[0];
-	index = (wdog_pool_vaddr >> 20) & 0xfff;
-
-	/* Modify the L1 entry directly:
-	 * - Set domain to WDOG_DOMAIN (domain 1)
-	 * - Set AP bits to Read-Only (AP2=1, AP[1:0]=11)
-	 * The AP bits stay RO permanently — we switch RW/RO via DACR.
-	 */
-	ro_entry = l1table[index];
-	ro_entry &= ~(0xf << PMD_SECT_DOMAIN_SHIFT);	/* clear domain field */
-	ro_entry |= (WDOG_DOMAIN << PMD_SECT_DOMAIN_SHIFT);	/* set domain 1 */
-	ro_entry |= PMD_SECT_AP2;				/* AP2 = 1 */
-	ro_entry |= (3 << PMD_SECT_AP_SHIFT);	/* AP[1:0] = 11 */
-	l1table[index] = ro_entry;
-
-	/* Flush TLB for the wdog pool section so the new domain field takes effect.
-	 * Although wd_mmu_protect_init() runs before any wdog access (so no stale
-	 * TLB entry exists), this is defensive — protects against future boot order
-	 * changes where init might be called after wdog pool access. */
-	__asm__ volatile("dsb" ::: "memory");
-	__asm__ volatile("mcr p15, 0, %0, c8, c7, 1" :: "r"(wdog_pool_vaddr) : "memory");
-	__asm__ volatile("dsb" ::: "memory");
-	__asm__ volatile("isb" ::: "memory");
-
-	/* Set DACR Domain 1 = Client (RO) via read-modify-write.
-	 * This preserves all other domains — fixes Defect #7. */
-	cp15_set_dacr_domain1_client();
-
-	g_wdog_mmu_initialized = true;
-
-	lldbg("WDOG_MMU: protection initialized (DACR domain %d, RO)\n", WDOG_DOMAIN);
-}
-
-
-
-
-
-/************************************************************************
- * Name: wd_mmu_write_begin
- *
- * Description:
- *   Change the watchdog pool memory region to read-write access.
- *   Changes L2 AP bits from NO_ACCESS to RW.
- *   
- *   Simplified from DACR approach:
- *   - NO runtime split (done at boot)
- *   - NO DACR register manipulation
- *   - Only L2 AP bit change + TLB flush
- *   - ~600 cycles (vs ~1100 cycles original, ~100 cycles DACR same-core)
- ************************************************************************/
-void wd_mmu_write_begin(void)
-{
-	irqstate_t flags;
-
-	if (!g_wdog_mmu_initialized) {
-		return;
-	}
-
-	/* Disable interrupts to prevent timer tick race condition.
-	 * The timer tick handler (wd_timer) may access wdog data; if it
-	 * fires between the DACR write and the wdog access, a Data Abort
-	 * can occur. Disabling IRQs ensures atomicity. */
-	flags = enter_critical_section();
-
-#ifdef CONFIG_SMP
-	{
-		int cpu = up_cpu_index();
-
-		/* Per-core nesting: if this core already has RW, just increment */
-		if (g_wdog_mmu_nest_count[cpu] > 0) {
-			g_wdog_mmu_nest_count[cpu]++;
-			leave_critical_section(flags);
-			return;
-		}
-
-		/* Set THIS core's DACR: Domain 1 = Manager (RW).
-		 * No spinlock — DACR is per-core, each core switches independently.
-		 * Shared wdog data structures are protected by enter_critical_section()
-		 * (g_cpu_irqlock on SMP) in wd_create/wd_start/wd_cancel/wd_delete/wd_timer. */
-		cp15_set_dacr_domain1_manager();
-
-		g_wdog_mmu_nest_count[cpu] = 1;
-
-#ifdef CONFIG_WDOG_MMU_DACR_DEBUG
-		if (g_wdbg_count < WDBG_MAX_PRINTS) {
-			uint32_t dacr_after;
-			__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr_after));
-			lldbg("WDBG: begin cpu=%d nest=%d dacr=0x%08x shadow=0x%08x\n",
-			      cpu, g_wdog_mmu_nest_count[cpu], dacr_after, g_dacr_shadow);
-			g_wdbg_count++;
-		}
-#endif
-	}
-#else
-
-	/* Single-core: simple nesting counter */
-	if (g_wdog_mmu_nest_count > 0) {
-		g_wdog_mmu_nest_count++;
-		leave_critical_section(flags);
-		return;
-	}
-
-	g_wdog_mmu_nest_count = 1;
-
-	/* Set Domain 1 = Manager (RW) via read-modify-write + dsb + isb */
-	cp15_set_dacr_domain1_manager();
-#endif
-
-	g_wdog_pool_is_ro = false;
-	leave_critical_section(flags);
-}
 
 
 
 
 
 
-/************************************************************************
- * Name: wd_mmu_write_end
- *
- * Description:
- *   Change the watchdog pool memory region back to read-only access.
- *   Sets DACR Domain 1 back to Client (RO).
- *   
- *   DACR approach:
- *   - NO L2 page table manipulation
- *   - NO TLB flush (only DACR write + barriers)
- *   - ~100 cycles (vs ~600+ cycles with L2 AP approach)
- ************************************************************************/
-void wd_mmu_write_end(void)
-{
-	irqstate_t flags;
+/* the end of the watchdog-protected region marker is not needed here */
 
-	if (!g_wdog_mmu_initialized) {
-		return;
-	}
-
-	/* Disable interrupts to prevent timer tick race condition */
-	flags = enter_critical_section();
-
-#ifdef CONFIG_SMP
-	{
-		int cpu = up_cpu_index();
-
-		/* Per-core nesting: decrement counter, only re-protect at 0 */
-		if (g_wdog_mmu_nest_count[cpu] > 1) {
-			g_wdog_mmu_nest_count[cpu]--;
-			leave_critical_section(flags);
-			return;
-		}
-
-		g_wdog_mmu_nest_count[cpu] = 0;
-
-		/* Set THIS core's DACR: Domain 1 = Client (RO).
-		 * No spinlock — DACR is per-core. */
-		cp15_set_dacr_domain1_client();
-
-#ifdef CONFIG_WDOG_MMU_DACR_DEBUG
-		if (g_wdbg_count < WDBG_MAX_PRINTS) {
-			uint32_t dacr_after;
-			__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr_after));
-			lldbg("WDBG: end   cpu=%d nest=%d dacr=0x%08x shadow=0x%08x\n",
-			      cpu, g_wdog_mmu_nest_count[cpu], dacr_after, g_dacr_shadow);
-			g_wdbg_count++;
-		}
-#endif
-	}
-#else
-
-	/* Single-core: simple nesting counter */
-	if (g_wdog_mmu_nest_count > 1) {
-
-		g_wdog_mmu_nest_count--;
-		leave_critical_section(flags);
-		return;
-	}
-
-	g_wdog_mmu_nest_count = 0;
-
-	if (g_wdog_pool_is_ro) {
-		leave_critical_section(flags);
-		return;
-	}
-
-	/* Set Domain 1 = Client (RO) via read-modify-write + dsb + isb */
-	cp15_set_dacr_domain1_client();
-#endif
-
-	g_wdog_pool_is_ro = true;
-	leave_critical_section(flags);
-}
-
-
-
-
-
-#endif /* CONFIG_WDOG_MMU_PROTECT */
 
 
 
@@ -548,6 +154,26 @@ bool wd_is_prealloc(WDOG_ID wdog)
 	}
 
 	return (wdog_ptr >= start) && (wdog_ptr <= end) && (((wdog_ptr - start) % sizeof(struct wdog_s)) == 0);
+}
+
+/************************************************************************
+ * Name: wd_activelist
+ *
+ * Description:
+ * This function returns the list of running watchdogs, read-only, for
+ * diagnostics outside the watchdog subsystem.
+ *
+ * Parameters:
+ *   None
+ *
+ * Return Value:
+ *   The head of the active watchdog list
+ *
+ ************************************************************************/
+
+FAR struct sq_queue_s *wd_activelist(void)
+{
+	return &g_wdog_data.core.activelist;
 }
 
 /************************************************************************
@@ -590,15 +216,18 @@ void wd_initialize(void)
 	/* All watchdogs are free */
 	g_wdnfree = CONFIG_PREALLOC_WDOGS;
 
-	/* Enable MMU page protection on the watchdog pool.
-	 * Sets the L1 section entry AP bits to Read-Only (AP2=1, AP[1:0]=11).
-	 * No L2 split is needed — .wdog_pool is in its own 1MB section.
-	 * Future writes must be bracketed by wd_mmu_write_begin()/end().
+	/* Protect the watchdog data page.  After this call the page holding
+	 * g_wdog_data is read-only and every write has to be bracketed by
+	 * wd_mmu_write_begin() / wd_mmu_write_end().  Nothing has touched the
+	 * watchdog data since the loop above, so this is the last moment at
+	 * which the page can be closed without opening a window.
 	 *
-	 * The heap spans the full DRAM (including the wdog pool's 1MB section),
-	 * but this is safe because the wdog pool is statically allocated and
-	 * the heap allocator will never hand out memory from the wdog pool's
-	 * addresses (they are not free heap blocks).
+	 * Failing to protect the page is reported and is not fatal: the
+	 * subsystem then runs unprotected, which is better than running
+	 * half-protected with a window that is never closed.
 	 */
-	wd_mmu_protect_init();
+
+	if (wd_mmu_protect_init() != OK) {
+		lldbg("WDOG_MMU: watchdog data page NOT protected\n");
+	}
 }

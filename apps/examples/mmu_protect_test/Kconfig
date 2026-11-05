@@ -13,22 +13,29 @@ config EXAMPLES_MMU_PROTECT_TEST
 		arm_mmu.c (mmu_save_page_pte, mmu_set_page_no_access,
 		mmu_set_page_ro, mmu_restore_page_pte).
 
-		Safe mode (default) verifies PTE manipulation without triggering
-		any faults.  UAF mode ("mmu_protect_test uaf") creates a real
-		use-after-free scenario: a page is protected via MMU, then
-		accessed.  The MMU triggers a Data Abort, which is the UAF
-		detection.
+		Safe mode (default) exercises descriptor manipulation without
+		triggering any fault.  The watchdog write window can be
+		reported and hammered without crashing (wdog_state,
+		wdog_page, wdog_refuse, wdog_pair).
 
 		Usage from TASH:
-		  mmu_protect_test           Run safe-mode tests (no Data Abort)
-		  mmu_protect_test save      Test mmu_save_page_pte
-		  mmu_protect_test noaccess  Test mmu_set_page_no_access (safe)
-		  mmu_protect_test ro         Test mmu_set_page_ro (safe)
-		  mmu_protect_test restore    Test mmu_restore_page_pte
-		  mmu_protect_test uaf        Trigger a real UAF Data Abort
+		  mmu_protect_test wdog            Watchdog data page: read (safe)
+		  mmu_protect_test wdog_write 1    Watchdog data page: write
+		  mmu_protect_test wdog_state      Write-window state + counters
+		  mmu_protect_test wdog_page       Live descriptor of the page
+		  mmu_protect_test wdog_refuse     Section address must be refused
+		  mmu_protect_test wdog_pair [N]   N window pairs + nesting test
+		  mmu_protect_test al_*            Split / RO / No-Access, incl. SMP
+		  mmu_protect_test scenario_*      Watchdog scenarios
+		  mmu_protect_test defect_*        Former defect reproductions
+		  mmu_protect_test region_report   Fault report, then PANIC
+		  mmu_protect_test tlb_bench       Section vs page timing
+		  mmu_protect_test heap_protect N  Heap UAF stress, N = 1..4
+		  mmu_protect_test read | write    UAF on a freed page
 
-		NOTE: Requires ARMv7-A with MMU.  The "uaf" subcommand causes
-		a fatal Data Abort (system crash/reboot).
+		NOTE: Requires ARMv7-A with MMU.  "read", "write",
+		"al_noaccess_abort", "region_report" and "heap_protect 4"
+		trigger a fatal Data Abort (system crash/reboot).
 
 config USER_ENTRYPOINT
 	string

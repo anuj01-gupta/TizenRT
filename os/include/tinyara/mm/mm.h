@@ -666,9 +666,15 @@ void mm_uaf_poison(FAR struct mm_freenode_s *node);
 void mm_uaf_verify(FAR struct mm_freenode_s *node);
 #endif
 
-#if defined(CONFIG_MM_HEAP_UAF_PROTECT) && defined(CONFIG_DEBUG_MM_UAF)
-#error "CONFIG_MM_HEAP_UAF_PROTECT and CONFIG_DEBUG_MM_UAF are mutually exclusive: mm_free() locks the freed chunk before mm_addfreechunk() calls mm_uaf_poison(), which would write to an AP=0 page (Data Abort on the first free of a chunk >= 4KB)"
-#endif
+/* Plan finding 1 / Q9: the poison pattern and page protection are
+ * COMPLEMENTARY BY SIZE, not mutually exclusive.  Chunks below
+ * MM_UAF_PROTECT_MIN_SIZE have no page to lock and stay with the pattern;
+ * chunks at or above it are covered by the descriptor.  The ordering that
+ * used to collide is fixed: mm_addfreechunk() now unlocks the node before
+ * mm_uaf_poison() writes the pattern (it can arrive already locked, because
+ * mm_free() locks at the allocated size before coalescing) and relocks it on
+ * the way out; mm_free()/mm_malloc() already unlock before mm_uaf_verify()
+ * reads it; and the verify dump skips No-Access pages (R5). */
 
 #if defined(CONFIG_MM_HEAP_UAF_PROTECT) && \
     (defined(CONFIG_BUILD_FLAT) || defined(__KERNEL__))
@@ -684,39 +690,72 @@ void mm_uaf_verify(FAR struct mm_freenode_s *node);
  *               locked (size grew since, edge chunk, ...) is a no-op.
  */
 #define MM_UAF_PROTECT_MIN_SIZE  4096	/* one HW page (MM_PGSIZE) */
-#define MM_UAF_PROTECT_MAX_SIZE  (128 * 1024)
-/* Chunks larger than MAX are region-init nodes or coalesced mega free-runs:
- * protecting them would storm page-table updates at boot.  They are skipped
- * and counted (g_protect_skipped), never silently. */
+/* The upper bound belongs to the arch and is asked for, never copied here:
+ * this header defined 128KB and arm_mmu.c defined the same 128KB a second
+ * time.  Raising one and not the other left every chunk in between silently
+ * refused by the arch, and the only symptom was the coverage counter falling
+ * while every call still returned OK.  Chunks above the bound are region-init
+ * nodes or coalesced mega free-runs: protecting them would storm page-table
+ * updates at boot.  They are skipped and counted (g_protect_skipped), never
+ * silently. */
 
 int mmu_protect_range_no_access(uintptr_t vaddr, size_t len);
 int mmu_restore_range(uintptr_t vaddr, size_t len);
+
+/* Largest range mmu_protect_range_no_access() accepts, in bytes.  One source
+ * of truth (arm_mmu.c MM_PROTECT_RANGE_MAX): a hook must never refuse a range
+ * the arch would have accepted, nor ask for one it would refuse. */
+
+size_t mmu_protect_range_max(void);
+
+/* R6: a protect request the arch refused (-ENOMEM: L2 pool or save table
+ * exhausted) leaves the chunk writable.  That must stay visible - plan 11.1
+ * demands coverage known, not assumed - so report it here, rate-limited:
+ * a saturated pool on a busy heap would otherwise turn every free() into
+ * console I/O. */
+
+static inline void mm_uaf_protect_warn(FAR const void *node, int ret)
+{
+	static uint32_t g_uaf_warned;
+
+	if (g_uaf_warned < 5) {
+		g_uaf_warned++;
+		lldbg("UAF: protect FAILED node=%p ret=%d (chunk stays writable - coverage incomplete, warning %u of 5)\n",
+		      node, ret, (unsigned int)g_uaf_warned);
+	}
+}
 
 #define MM_UAF_PROTECT_ON_FREE(node) \
 	do { \
 		FAR struct mm_freenode_s *_uafn = (FAR struct mm_freenode_s *)(node); \
 		if (_uafn->size >= MM_UAF_PROTECT_MIN_SIZE) { \
 			uintptr_t _data = (uintptr_t)_uafn + SIZEOF_MM_FREENODE; \
-			mmu_protect_range_no_access(_data, \
-						    _uafn->size - SIZEOF_MM_FREENODE); \
+			int _ret = mmu_protect_range_no_access(_data, \
+						       _uafn->size - SIZEOF_MM_FREENODE); \
+			if (_ret < 0) { \
+				mm_uaf_protect_warn(_uafn, _ret); \
+			} \
 		} \
 	} while (0)
 
 /* Variant for a chunk that is STILL an allocnode: mm_free() calls this
  * before coalescing, while the node still has its allocated size.  After
  * the merge the very same range is a coalesced free-run of many MB, which
- * is always larger than MM_UAF_PROTECT_MAX_SIZE and gets skipped, so
- * protecting only from mm_addfreechunk() never locks anything.  The header
- * offset of an allocnode differs from that of a freenode, hence the
- * separate macro. */
+ * is always larger than the arch bound (mmu_protect_range_max()) and gets
+ * skipped, so protecting only from mm_addfreechunk() never locks anything.
+ * The header offset of an allocnode differs from that of a freenode, hence
+ * the separate macro. */
 #define MM_UAF_PROTECT_ON_FREE_HDR(node) \
 	do { \
 		FAR struct mm_allocnode_s *_uafn = (FAR struct mm_allocnode_s *)(node); \
 		if (_uafn->size >= MM_UAF_PROTECT_MIN_SIZE && \
-		    _uafn->size <= MM_UAF_PROTECT_MAX_SIZE) { \
+		    _uafn->size <= mmu_protect_range_max()) { \
 			uintptr_t _data = (uintptr_t)_uafn + SIZEOF_MM_ALLOCNODE; \
-			mmu_protect_range_no_access(_data, \
-						    _uafn->size - SIZEOF_MM_ALLOCNODE); \
+			int _ret = mmu_protect_range_no_access(_data, \
+						       _uafn->size - SIZEOF_MM_ALLOCNODE); \
+			if (_ret < 0) { \
+				mm_uaf_protect_warn(_uafn, _ret); \
+			} \
 		} \
 	} while (0)
 

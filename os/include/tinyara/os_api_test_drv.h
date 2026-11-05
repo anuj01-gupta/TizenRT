@@ -116,9 +116,20 @@ struct mmu_tlb_bench_s {
 	uint32_t split_cost_us;	/* Phase C: one runtime section split */
 	uint32_t op_cost_us;	/* Phase D: one protect+restore pair */
 	uint32_t sections_split;/* L2 tables consumed by the working set */
+	uint32_t window_pair_us;	/* Phase E: one watchdog write window
+									 * opened and closed (one descriptor
+									 * changed, both cores told) */
+	uint32_t pool_claimed;		/* L2 pool tables claimed when the run ends */
+	uint32_t pool_total;		/* CONFIG_MMU_L2_POOL_TABLES */
+	uint32_t pool_held;		/* of those, tagged for a protected region */
+	uint32_t saved_used;		/* pages currently locked in the save table */
+	uint32_t saved_max;		/* MM_PROTECT_SAVED_MAX: the real ceiling */
 };
 
-/* TC-R4: allocator UAF-protection stress.  arg = phase 1..4 (4 = FATAL) */
+/* TC-R4: allocator UAF-protection stress.  arg = phase 1..4 (4 = FATAL).
+ * Phase 5 is the M4 endurance variant: arg = 5 | (minutes << 8), runs the
+ * mixed-size churn (plus core-1 churn hourly under SMP) until the minutes
+ * expire; it never issues a fatal write. */
 #ifdef CONFIG_MM_HEAP_UAF_PROTECT
 #define TESTIOC_MMU_HEAP_PROTECT_STRESS		_TESTIOC(54)
 #endif
@@ -131,12 +142,30 @@ struct mmu_tlb_bench_s {
 #ifdef CONFIG_WDOG_MMU_DEFECT_TEST
 #define TESTIOC_WDOG_DEFECT_SMP			_TESTIOC(28)
 #define TESTIOC_WDOG_DEFECT_DSB			_TESTIOC(29)
-#define TESTIOC_WDOG_DEFECT_DACR_CLOBBER	_TESTIOC(30)
+#define TESTIOC_WDOG_DEFECT_DOMAIN_KEEP		_TESTIOC(30)
 #define TESTIOC_WDOG_DEFECT_HEAP_OVERLAP	_TESTIOC(31)
 #define TESTIOC_WDOG_DEFECT_WD_RECOVER		_TESTIOC(32)
 #define TESTIOC_WDOG_DEFECT_ABORT_HANDLER	_TESTIOC(33)
 #define TESTIOC_WDOG_DEFECT_BOOT_ORDER		_TESTIOC(34)
 #define TESTIOC_WDOG_DEFECT_SECTION_SIZE	_TESTIOC(35)
+#endif
+
+#ifdef CONFIG_WDOG_MMU_PROTECT
+/* Watchdog write-window checks.  Read-only or self-restoring: they report the
+ * state of the one descriptor that protects the watchdog data page, check
+ * that a write outside a window is refused, and time one window. */
+#define TESTIOC_WDOG_MMU_WINDOW_STATE		_TESTIOC(58)
+#define TESTIOC_WDOG_MMU_PAGE_REPORT		_TESTIOC(59)
+#define TESTIOC_WDOG_MMU_REFUSE_SECTION		_TESTIOC(60)
+#define TESTIOC_WDOG_MMU_WINDOW_PAIR		_TESTIOC(61)
+#endif
+
+#ifdef CONFIG_MMU_PAGE_PROTECT
+/* L2 page-table pool accounting (safe, read-only): reports the tables
+ * claimed of the tables CONFIG_MMU_L2_POOL_TABLES allows, and checks that a
+ * repeated split of the same section does not claim another one.  Retired
+ * ids 55-57 are deliberately not reused. */
+#define TESTIOC_MMU_L2_POOL_USAGE		_TESTIOC(62)
 #endif
 
 #ifdef CONFIG_WDOG_MMU_SCENARIO_TEST

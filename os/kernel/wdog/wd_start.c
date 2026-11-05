@@ -131,15 +131,37 @@ typedef void (*wdentry4_t)(int argc, uint32_t arg1, uint32_t arg2, uint32_t arg3
 static inline void wd_expiration(void)
 {
 	FAR struct wdog_s *wdog;
+	FAR sq_entry_t *node;
+	FAR sq_entry_t *next;
+	sq_queue_t expired;
 
 	/* Check if the watchdog at the head of the list is ready to run */
 
 	if (((FAR struct wdog_s *)g_wdactivelist.head)->lag <= 0) {
-		/* Process the watchdog at the head of the list as well as any
-		 * other watchdogs that became ready to run at this time
+		/* Detach every watchdog that became ready to run in a single
+		 * write window, then run their callbacks with the watchdog page
+		 * read-only again.  That keeps a wild write inside a callback
+		 * caught, and it stops the number of permission changes per
+		 * timer tick from growing with the number of watchdogs that
+		 * expire in that tick.
+		 *
+		 * 'expired' is a list head on this stack frame, outside the
+		 * protected page; only the links inside the detached watchdogs
+		 * themselves are written, and every one of those writes is
+		 * inside the window below.
 		 */
 
-		wd_mmu_write_begin();	/* Allow writes to wdog protected page */
+		sq_init(&expired);
+
+		/* Allow writes to wdog protected page.  If the descriptor could
+		 * not be made writable, nothing here may be linked or unlinked:
+		 * the timers keep their lag, this tick is skipped, and the next
+		 * one finds the very same list ready to run.
+		 */
+
+		if (wd_mmu_write_begin() != OK) {
+			return;
+		}
 
 		while (g_wdactivelist.head && ((FAR struct wdog_s *)g_wdactivelist.head)->lag <= 0) {
 			/* Remove the watchdog from the head of the list */
@@ -158,16 +180,34 @@ static inline void wd_expiration(void)
 
 			WDOG_CLRACTIVE(wdog);
 
-			/* Re-protect before calling the callback — the callback
-			 * may call wd_start()/wd_cancel() which use their own
-			 * begin/end brackets.  We re-enable protection here so
-			 * that wild writes during the callback are still caught.
-			 */
+			sq_addlast((FAR sq_entry_t *)wdog, &expired);
+		}
 
-			wd_mmu_write_end();
+		/* The window above is bounded by construction: it detaches at
+		 * most the CONFIG_PREALLOC_WDOGS entries of the pool, and it is
+		 * one descriptor pair for the whole batch rather than one per
+		 * expired watchdog. */
 
-			/* Execute the watchdog function */
+		wd_mmu_write_end();	/* Re-protect before any callback runs */
 
+		/* Releasing the last reference is what puts the page back
+		 * behind its read-only descriptor.  If a batch is still
+		 * attached here, the window did not close and a callback would
+		 * have been able to write to a read-only page. */
+
+		DEBUGASSERT(wd_mmu_is_protected());
+
+		/* Execute the watchdog functions.  The detached list is only
+		 * read here - never linked or unlinked - so no write reaches
+		 * the protected page while a callback runs.  A callback that
+		 * restarts the watchdog it was called for puts it back on the
+		 * active list; the link saved before the call keeps this
+		 * traversal on the entries that actually expired.
+		 */
+
+		for (node = expired.head; node != NULL; node = next) {
+			next = sq_next(node);
+			wdog = (FAR struct wdog_s *)node;
 
 			up_setpicbase(wdog->picbase);
 			switch (wdog->argc) {
@@ -201,14 +241,7 @@ static inline void wd_expiration(void)
 				break;
 #endif
 			}
-
-			/* Re-disable protection for the next loop iteration.
-			 * sq_remfirst() on the next iteration writes to wdog pool
-			 * memory, so we must be in RW mode.
-			 */
-			wd_mmu_write_begin();
 		}
-		wd_mmu_write_end();
 	}
 }
 
@@ -267,13 +300,6 @@ int wd_start(WDOG_ID wdog, int delay, wdentry_t wdentry, int argc, ...)
 		return ERROR;
 	}
 
-#ifdef CONFIG_DEBUG
-	/* Store the pid of process to keep track which process is responsible for wdog expiration */
-	wd_mmu_write_begin();
-	wdog->pid = getpid();
-	wd_mmu_write_end();
-#endif
-
 	/* Check if the watchdog has been started. If so, stop it.
 	 * NOTE:  There is a race condition here... the caller may receive
 	 * the watchdog between the time that wd_start is called and
@@ -285,9 +311,27 @@ int wd_start(WDOG_ID wdog, int delay, wdentry_t wdentry, int argc, ...)
 		wd_cancel(wdog);
 	}
 
-	/* Save the data in the watchdog structure */
+	/* Save the data in the watchdog structure.  Those fields live on the
+	 * watchdog data page, so the write window has to be open before the
+	 * first store: a window that could not be opened leaves the descriptor
+	 * Read-Only, and the stores below would fault.  The timer is therefore
+	 * not armed and the caller is told, with the critical section released
+	 * the same way as every other exit from this function.
+	 */
 
-	wd_mmu_write_begin();		/* Allow writes to wdog protected page */
+	if (wd_mmu_write_begin() != OK) {
+		leave_critical_section(state);
+		return -EIO;
+	}
+
+#ifdef CONFIG_DEBUG
+	/* Store the pid of the process responsible for this wdog expiration.
+	 * It is written inside the same window as the rest of the structure:
+	 * one bracket per write sequence, not one per field.
+	 */
+
+	wdog->pid = getpid();
+#endif
 
 	wdog->func = wdentry;		/* Function to execute when delay expires */
 	up_getpicbase(&wdog->picbase);
@@ -443,7 +487,20 @@ int wd_start(WDOG_ID wdog, int delay, wdentry_t wdentry, int argc, ...)
 unsigned int wd_timer(int ticks)
 {
 	FAR struct wdog_s *wdog;
+	irqstate_t flags;
 	int decr;
+
+	/* The whole tick runs inside one critical section.  Every write to the
+	 * watchdog data page goes through the write window, and that window is
+	 * counted by a single nesting counter that both cores share: the
+	 * descriptor they share is a single piece of memory, so two cores
+	 * opening the window at once would leave the counter one while the
+	 * first of them had already closed it again (design 5.4).  Holding the
+	 * critical section for the tick is what makes the counter sound; the
+	 * return value of wd_mmu_write_begin() is what makes it honest.
+	 */
+
+	flags = enter_critical_section();
 
 	/* Check if there are any active watchdogs to process */
 
@@ -464,11 +521,16 @@ unsigned int wd_timer(int ticks)
 
 		decr = MIN(wdog->lag, ticks);
 
-		/* There are.  Decrement the lag counter */
+		/* There are.  Decrement the lag counter.  A window that could not
+		 * be opened means the descriptor is still Read-Only, so the lag
+		 * write would fault: skip the decrement rather than fault on it.
+		 */
 
-		wd_mmu_write_begin();
-		wdog->lag -= decr;
-		wd_mmu_write_end();
+		if (wd_mmu_write_begin() == OK) {
+			wdog->lag -= decr;
+			wd_mmu_write_end();
+		}
+
 		ticks -= decr;
 
 		/* Check if the watchdog at the head of the list is ready to run */
@@ -476,8 +538,9 @@ unsigned int wd_timer(int ticks)
 		wd_expiration();
 	}
 
-	/* Return the delay for the next watchdog to expire */
+	leave_critical_section(flags);
 
+	/* Return the delay for the next watchdog to expire */
 
 	return g_wdactivelist.head ? ((FAR struct wdog_s *)g_wdactivelist.head)->lag : 0;
 }
@@ -485,19 +548,41 @@ unsigned int wd_timer(int ticks)
 #else
 void wd_timer(void)
 {
+	irqstate_t flags;
+
 	/* Check if there are any active watchdogs to process */
 
 	if (g_wdactivelist.head) {
-		/* There are.  Decrement the lag counter */
+		/* The tick writes the watchdog data page twice: the lag of the
+		 * head timer here, and the links of every timer that
+		 * wd_expiration() detaches below.  Both writes go through the
+		 * write window, and that window is counted by one nesting
+		 * counter that the two cores share - the descriptor they share
+		 * is a single piece of memory, so if both cores opened the
+		 * window the counter would read one after the first of them had
+		 * already restored the Read-Only descriptor, and the other core
+		 * would be writing to a page its own TLB says is not writable
+		 * (design 5.4).  One critical section around the tick is what
+		 * keeps the other core out of the window.
+		 */
 
-		wd_mmu_write_begin();
-		--(((FAR struct wdog_s *)g_wdactivelist.head)->lag);
-		wd_mmu_write_end();
+		flags = enter_critical_section();
+
+		/* There are.  Decrement the lag counter.  A window that could
+		 * not be opened means the descriptor is still Read-Only, so the
+		 * write would fault: skip the tick instead.
+		 */
+
+		if (wd_mmu_write_begin() == OK) {
+			--(((FAR struct wdog_s *)g_wdactivelist.head)->lag);
+			wd_mmu_write_end();
+		}
 
 		/* Check if the watchdog at the head of the list is ready to run */
 
-
 		wd_expiration();
+
+		leave_critical_section(flags);
 	}
 
 }
@@ -507,22 +592,46 @@ void wd_timer(void)
 void wd_timer_nohz(clock_t ticks)
 {
 	FAR struct wdog_s *wdog;
+	irqstate_t flags;
 	int decr;
 
-	for (wdog = g_wdactivelist.head; ticks > 0 && wdog; wdog = wdog->next) {
+	/* Deciding how far each watchdog still has to wait only reads the
+	 * list; the writes are the lag updates.  Doing the whole pass inside
+	 * one window costs one pair of permission changes per suspend
+	 * interval instead of one pair per watchdog.
+	 *
+	 * The window is counted by a single nesting counter that both cores
+	 * share, so it is opened under a critical section (design 5.4).
+	 */
+
+	flags = enter_critical_section();
+
+	if (wd_mmu_write_begin() != OK) {
+		/* The page is still Read-Only: every wdog->lag write below would
+		 * fault.  Leave the lags alone - the tick that follows the
+		 * resume makes up the time - and let the counter inside
+		 * wd_mmu_protect.c record the refusal.
+		 */
+
+		leave_critical_section(flags);
+		return;
+	}
+
+	for (wdog = (FAR struct wdog_s *)g_wdactivelist.head; ticks > 0 && wdog;
+	     wdog = wdog->next) {
 
 		/* Decrement the lag for this watchdog. */
 
 		decr = MIN(wdog->lag, ticks);
 
-		/* There are.  Decrement the lag counter */
-
-		wd_mmu_write_begin();
 		wdog->lag -= decr;
-		wd_mmu_write_end();
 		ticks -= decr;
 
 		/* Expires when the next wd_timer is called.*/
 	}
+
+	wd_mmu_write_end();			/* Re-protect wdog page (Read-Only) */
+
+	leave_critical_section(flags);
 }
 #endif

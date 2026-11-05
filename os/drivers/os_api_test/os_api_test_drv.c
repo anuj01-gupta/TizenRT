@@ -27,10 +27,19 @@
 #include <string.h>
 
 #include <tinyara/fs/fs.h>
+#include <stdbool.h>
 #include <tinyara/os_api_test_drv.h>
 #include <tinyara/sched.h>
 #include <tinyara/irq.h>
 #include <tinyara/mmu.h>
+#ifdef CONFIG_WDOG_MMU_DEFECT_TEST
+/* Real kernel heap boundaries (mm_heapstart[] / mm_heapend[]) are needed to
+ * tell whether the allocator can reach the watchdog page.  Membership in
+ * CONFIG_RAM_START..+CONFIG_RAM_SIZE cannot answer that: on this SoC that
+ * range covers every DDR address.
+ */
+#include <tinyara/mm/mm.h>
+#endif
 #ifdef CONFIG_MMU_PAGE_PROTECT
 #include <tinyara/arch.h>
 #include <time.h>
@@ -94,6 +103,41 @@ static const struct file_operations os_api_test_drv_fops = {
 #endif
 };
 
+#if defined(CONFIG_MMU_PAGE_PROTECT) || defined(CONFIG_WDOG_MMU_PROTECT)
+/* Every call that changes a descriptor or opens a write window returns a
+ * status.  The cases below used to discard it, so a refused window or a
+ * restore that did not take printed exactly the same "done" line as a
+ * success.  MMU_TRY() reports the status once and counts it; MMU_TRYQ() only
+ * counts it, for the loops that measure time and must not print.  A case may
+ * only claim PASS while the count stays where it started.
+ */
+
+static int g_mmu_op_failures;
+
+#define MMU_TRY(call) \
+	do \
+	  { \
+		int _st = (call); \
+		if (_st != OK) \
+		  { \
+			g_mmu_op_failures++; \
+			lldbg("MMU_OP: %s -> %d\n", #call, _st); \
+		  } \
+	  } \
+	while (0)
+
+#define MMU_TRYQ(call) \
+	do \
+	  { \
+		if ((call) != OK) \
+		  { \
+			g_mmu_op_failures++; \
+		  } \
+	  } \
+	while (0)
+#endif /* CONFIG_MMU_PAGE_PROTECT || CONFIG_WDOG_MMU_PROTECT */
+
+
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
@@ -110,8 +154,17 @@ static const struct file_operations os_api_test_drv_fops = {
 #define R3_WS_SIZE    (4 * 1024 * 1024)
 #define R3_REPS       250
 #define R3_SPLIT_REPS 4       /* fresh sections timed for the Phase C cost */
-#define R3_PAIR_REPS  2000    /* protect+restore pairs timed in Phase D    */
-#define R3_PAIR_BATCH 100     /* pairs per Phase D timing sample           */
+#define R3_PAIR_REPS  4000    /* protect+restore pairs timed in Phase D/E  */
+#define R3_PAIR_BATCH 1000    /* pairs per timing sample                   */
+
+/* Per-pair resolution of the batch average, in microseconds: one clock tick
+ * (1000us here) divided by the number of pairs in one sample.  With the old
+ * batch of 100 this was 10us, so the reported "3 us" and "0 us" were below
+ * what the measurement can resolve at all; a value under this figure is
+ * printed as "below clock resolution" instead of as a number.
+ */
+
+#define R3_TICK_US    (1000 / R3_PAIR_BATCH)
 
 static uint32_t r3_now_us(void)
 {
@@ -145,6 +198,47 @@ static void r3_workload(FAR uint32_t *ws, uint32_t reps)
 	}
 }
 #endif /* CONFIG_MMU_PAGE_PROTECT */
+/* R4 coverage: how much of the free() traffic the UAF hook actually
+ * protected.  Reported next to the counters because "failed_budget = 0" on
+ * its own says nothing when almost every free() was skipped (observed on
+ * rtl8730e: ok=151 skipped=961, i.e. ~13%).  Defined outside the
+ * CONFIG_MMU_PAGE_PROTECT block because the R4 case is guarded by
+ * CONFIG_MM_HEAP_UAF_PROTECT.
+ */
+
+#define R4_COVERAGE(ok, skipped) \
+	(((ok) + (skipped)) ? (unsigned int)((ok) * 100u / ((ok) + (skipped))) : 0u)
+
+/* TC-R4 helper: one round of mixed-size churn.  Shared by step 2 and the
+ * phase-5 endurance loop so there is one definition of the workload. */
+
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+static void r4_mixed_churn(int iterations)
+{
+	int i;
+
+	for (i = 0; i < iterations; i++) {
+		FAR uint8_t *a = (FAR uint8_t *)kmm_malloc(4096);
+		FAR uint8_t *b = (FAR uint8_t *)kmm_malloc(5120);
+		FAR uint8_t *c = (FAR uint8_t *)kmm_malloc(64 * 1024);
+
+		if (a) {
+			a[0] = (uint8_t)i;
+			a[4095] = (uint8_t)i;
+		}
+		if (b) {
+			b[0] = (uint8_t)i;
+		}
+		if (c) {
+			c[0] = (uint8_t)i;
+			c[65535] = (uint8_t)i;
+		}
+		kmm_free(a);
+		kmm_free(b);
+		kmm_free(c);
+	}
+}
+#endif /* CONFIG_MM_HEAP_UAF_PROTECT */
 
 /* TC-R4 helper: core-1 heap churn thread (step 3, dual-core) */
 #if defined(CONFIG_MM_HEAP_UAF_PROTECT) && defined(CONFIG_SMP)
@@ -503,7 +597,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		/* If we reach here, protection failed */
 		(void)val;
 		lldbg("UAF test: ERROR — access succeeded, Data Abort NOT triggered!\n");
-		mmu_restore_page_pte(page_addr, mmu_save_page_pte(page_addr));
+		MMU_TRY(mmu_restore_page_pte(page_addr, mmu_save_page_pte(page_addr)));
 		free(buf);
 		ret = -EIO;
 		break;
@@ -626,15 +720,21 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 			sect_entry |= ((l2_entry >> 0) & 0x1) << 4;     /* XN */
 			sect_entry |= (1 << 16);                         /* S */
 			
-			/* Restore to section */
+			/* Restore to section.  The L2 table this entry pointed
+			 * at stays claimed - the pool has no release path by
+			 * design (arm_mmu.c:812), so each re-split claims a
+			 * fresh table and l2_pool (id 62) counts it. */
 			l1table[l1_index] = sect_entry;
 			
-			/* Flush TLB */
-			__asm__ volatile("mcr p15, 0, %0, c8, c7, 0" :: "r"(0));
+			/* Invalidate by MVA, inner shareable - the form
+			 * mmu_split_section_to_l2() uses (arm_mmu.c:268): the
+			 * peer core may still hold the 1MB section entry. */
+			__asm__ volatile("mcr p15, 0, %0, c8, c3, 3" :: "r"(sect_addr));
 			__asm__ volatile("dsb sy");
 			__asm__ volatile("isb");
 			
-			lldbg("R1: Restored to section 0x%08X\n", sect_entry);
+			lldbg("R1: Restored to section 0x%08X (MVA invalidate, shareable)\n",
+			      sect_entry);
 			
 			/* Update original_l1 for comparison later */
 			original_l1 = sect_entry;
@@ -747,6 +847,8 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 	case TESTIOC_AL_SPLIT: {
 		uint8_t *buf;
 		uint32_t page_addr;
+		uint32_t pte = 0;
+		uint8_t ap = 0xff;
 
 		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
 		if (!buf) {
@@ -757,11 +859,24 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 
 		lldbg("AL SPLIT: page=0x%08x, calling mmu_split_section_to_l2\n", page_addr);
 
-		mmu_split_section_to_l2(page_addr);
+		MMU_TRY(mmu_split_section_to_l2(page_addr));
 
 		/* Verify memory is still accessible after split */
 		memset((void *)page_addr, 0xAA, 4096);
-		lldbg("AL SPLIT: memory read/write OK after split\n");
+
+		/* And that the split really happened: "no crash" was the
+		 * whole test before, so a split that was refused (L2 pool
+		 * exhausted, for instance) printed the same PASS line. */
+
+		if (mmu_get_page_pte_raw(page_addr, &pte, &ap) != OK) {
+			lldbg("AL SPLIT: FAIL - section is still not 4KB-mapped\n");
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+
+		lldbg("AL SPLIT: memory read/write OK, now 4KB-mapped (pte=0x%08x AP=%u)\n",
+		      pte, (unsigned int)ap);
 
 		kmm_free(buf);
 		ret = OK;
@@ -773,6 +888,8 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		uint8_t *buf;
 		uint32_t page_addr;
 		uint32_t saved_pte;
+		uint32_t pte = 0;
+		uint8_t ap = 0xff;
 
 		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
 		if (!buf) {
@@ -782,14 +899,42 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		page_addr = ((uint32_t)buf + 4095) & ~4095u;
 		memset((void *)page_addr, 0xAA, 4096);
 
+		/* mmu_set_page_no_access() refuses a plain 1MB section with
+		 * -EINVAL, so without this split the case protected nothing
+		 * and still reported PASS.  Split first, then assert each
+		 * step against the live descriptor instead of against the
+		 * absence of a crash. */
+
+		MMU_TRY(mmu_split_section_to_l2(page_addr));
+
 		saved_pte = mmu_save_page_pte(page_addr);
 		lldbg("AL NOACCESS_RESTORE: saved_pte=0x%08x\n", saved_pte);
 
-		mmu_set_page_no_access(page_addr);
-		lldbg("AL NOACCESS_RESTORE: page set to No-Access\n");
+		MMU_TRY(mmu_set_page_no_access(page_addr));
 
-		mmu_restore_page_pte(page_addr, saved_pte);
-		lldbg("AL NOACCESS_RESTORE: page restored\n");
+		if (mmu_get_page_pte_raw(page_addr, &pte, &ap) != OK || ap != 0) {
+			lldbg("AL NOACCESS_RESTORE: FAIL - not No-Access after set (pte=0x%08x AP=%u)\n",
+			      pte, (unsigned int)ap);
+			MMU_TRY(mmu_restore_page_pte(page_addr, saved_pte));
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+
+		lldbg("AL NOACCESS_RESTORE: page is No-Access (pte=0x%08x AP=0)\n", pte);
+
+		MMU_TRY(mmu_restore_page_pte(page_addr, saved_pte));
+
+		if (mmu_get_page_pte_raw(page_addr, &pte, &ap) != OK ||
+		    pte != saved_pte) {
+			lldbg("AL NOACCESS_RESTORE: FAIL - descriptor not restored (pte=0x%08x saved=0x%08x)\n",
+			      pte, saved_pte);
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+
+		lldbg("AL NOACCESS_RESTORE: page restored to 0x%08x\n", pte);
 
 		/* Verify access works after restore */
 		((volatile uint8_t *)page_addr)[0] = 0xBB;
@@ -805,6 +950,8 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		uint8_t *buf;
 		uint32_t page_addr;
 		uint32_t saved_pte;
+		uint32_t pte = 0;
+		uint8_t ap = 0xff;
 		volatile uint8_t val;
 
 		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
@@ -815,18 +962,52 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		page_addr = ((uint32_t)buf + 4095) & ~4095u;
 		memset((void *)page_addr, 0xAA, 4096);
 
+		/* Same reason as AL-02: the RO set is refused on a plain
+		 * section, so the case has to split first to be a test. */
+
+		MMU_TRY(mmu_split_section_to_l2(page_addr));
+
 		saved_pte = mmu_save_page_pte(page_addr);
 		lldbg("AL RO_RESTORE: saved_pte=0x%08x\n", saved_pte);
 
-		mmu_set_page_ro(page_addr);
-		lldbg("AL RO_RESTORE: page set to Read-Only\n");
+		MMU_TRY(mmu_set_page_ro(page_addr));
+
+		/* Read-only means AP2 is set: with domain 0 = Client that is
+		 * what turns the page read-only for privileged code, and it
+		 * is the same test wdog_page/defect_smp apply.  (The folded
+		 * value is 3 in the normal AP[2:0] model and 2 in the
+		 * CONFIG_AFE_ENABLE AP[2:1] model, so AP2 is tested, not the
+		 * number.)  Anything else means the descriptor was never
+		 * changed, which is exactly what this case used to miss.
+		 */
+
+		if (mmu_get_page_pte_raw(page_addr, &pte, &ap) != OK || !(ap & 2)) {
+			lldbg("AL RO_RESTORE: FAIL - not read-only after set (pte=0x%08x AP=%u, AP2 must be set)\n",
+			      pte, (unsigned int)ap);
+			MMU_TRY(mmu_restore_page_pte(page_addr, saved_pte));
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+
+		lldbg("AL RO_RESTORE: page is Read-Only (pte=0x%08x AP=3)\n", pte);
 
 		/* Read should succeed under RO */
 		val = ((volatile uint8_t *)page_addr)[0];
 		lldbg("AL RO_RESTORE: read under RO OK, val=0x%02x\n", val);
 
-		mmu_restore_page_pte(page_addr, saved_pte);
-		lldbg("AL RO_RESTORE: page restored\n");
+		MMU_TRY(mmu_restore_page_pte(page_addr, saved_pte));
+
+		if (mmu_get_page_pte_raw(page_addr, &pte, &ap) != OK ||
+		    pte != saved_pte) {
+			lldbg("AL RO_RESTORE: FAIL - descriptor not restored (pte=0x%08x saved=0x%08x)\n",
+			      pte, saved_pte);
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+
+		lldbg("AL RO_RESTORE: page restored to 0x%08x\n", pte);
 
 		/* Write should succeed after restore */
 		((volatile uint8_t *)page_addr)[0] = 0xCC;
@@ -837,25 +1018,32 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		break;
 	}
 
-	/* TC-AL-04: No-access triggers Data Abort (Fatal)
+	/* TC-AL-04: Protection of a section-mapped address is refused (Safe)
 	 *
-	 * Sets an entire 1MB section to No-Access WITHOUT splitting to 4KB.
-	 * Since the kernel heap (and TCB) reside in the same 1MB section,
-	 * the Data Abort handler itself faults → nested Data Abort.
+	 * This case used to set a whole 1MB section to No-Access and read
+	 * from it, expecting the resulting Data Abort to nest (the section
+	 * also covers the TCB).  That premise is obsolete: the arch layer
+	 * refuses to widen a 4KB permission change to a 1MB section
+	 * (mmu_set_page_no_access() -> -EINVAL, "not 4KB-mapped - refused"),
+	 * so the abort cannot happen and the case could only ever print
+	 * "ERROR - no Data Abort occurred!".
 	 *
-	 * This nested abort is EXPECTED — it proves split_section_to_l2()
-	 * is required before page-level protection in kernel context.
-	 * See AL-05 for the correct approach (split first, then protect 4KB).
+	 * What is asserted now is the refusal itself, which is the behaviour
+	 * the kernel has to guarantee, plus the consequence that matters:
+	 * nothing was written and the memory is still there.  Same invariant
+	 * wdog_refuse (TESTIOC_WDOG_MMU_REFUSE_SECTION) checks for the
+	 * watchdog page.  Non-fatal by design.
 	 */
 	case TESTIOC_AL_NOACCESS_ABORT: {
 		uint8_t *buf;
 		uint32_t page_addr;
-		uint32_t saved_pte;
 		volatile uint8_t val;
-#ifdef CONFIG_SMP
-		cpu_set_t cpu_mask;
-		cpu_set_t orig_mask;
-#endif
+		uint32_t saved_pte;
+		uint32_t pte = 0;
+		uint8_t ap = 0xff;
+		bool mapped;
+		int status;
+		int ops_before = g_mmu_op_failures;
 
 		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
 		if (!buf) {
@@ -865,38 +1053,125 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		page_addr = ((uint32_t)buf + 4095) & ~4095u;
 		memset((void *)page_addr, 0xAA, 4096);
 
-#ifdef CONFIG_SMP
-		/* Pin to Core 0 — single-core test, prevent scheduler migration */
-		sched_getaffinity(getpid(), sizeof(cpu_set_t), &orig_mask);
-		CPU_ZERO(&cpu_mask);
-		CPU_SET(0, &cpu_mask);
-		sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpu_mask);
-		lldbg("AL NOACCESS_ABORT: Pinned to CPU 0 (was CPU %d)\n", up_cpu_index());
-#endif
-
-		lldbg("AL NOACCESS_ABORT: Setting 1MB section to No-Access (NO split)\n");
-		lldbg("AL NOACCESS_ABORT: page 0x%08x is in 1MB section with TCB/stacks\n", page_addr);
-
-		saved_pte = mmu_save_page_pte(page_addr);
-		mmu_set_page_no_access(page_addr);
-		lldbg("AL NOACCESS_ABORT: 1MB section set to No-Access on CPU %d\n", up_cpu_index());
-		lldbg("AL NOACCESS_ABORT: >>> READ, expect Data Abort <<<\n");
-		lldbg("AL NOACCESS_ABORT: NOTE: Nested Data Abort is EXPECTED here!\n");
-		lldbg("AL NOACCESS_ABORT:   Reason: 1MB section contains TCB/stacks.\n");
-		lldbg("AL NOACCESS_ABORT:   Abort handler accesses TCB → nested abort.\n");
-		lldbg("AL NOACCESS_ABORT:   This proves split_section_to_l2() is required.\n");
-		lldbg("AL NOACCESS_ABORT:   See AL-05 for correct approach (split first).\n");
+		/* Take the value and the descriptor snapshot BEFORE the
+		 * protect call: once the page is No-Access the read below
+		 * faults, and nothing may touch the page until the
+		 * descriptor is back in place.
+		 *
+		 * The buffer comes from the kernel heap and every other AL
+		 * case allocates the same size, so the allocator hands this
+		 * case the very page an earlier al_split(),
+		 * al_noaccess_restore(), al_ro_restore(), al_smp_restore() or
+		 * al_smp_split() run turned into a 4KB page.  Nothing in the
+		 * kernel merges an L1 table back into a 1MB section, so the
+		 * section-refusal behaviour is only observable when no AL
+		 * case has run yet in this boot.  Ask the page tables which
+		 * guarantee applies here instead of printing an assumption:
+		 * mmu_get_page_pte_raw() fails with -EINVAL for exactly the
+		 * addresses mmu_set_page_no_access() refuses - both test
+		 * (l1_entry & PMD_TYPE_MASK) != PMD_TYPE_PTE.
+		 */
 
 		val = ((volatile uint8_t *)page_addr)[0];
-		(void)val;
+		saved_pte = mmu_save_page_pte(page_addr);
+		mapped = (mmu_get_page_pte_raw(page_addr, &pte, &ap) == OK);
 
-		lldbg("AL NOACCESS_ABORT: ERROR — no Data Abort occurred!\n");
-		mmu_restore_page_pte(page_addr, saved_pte);
-#ifdef CONFIG_SMP
-		sched_setaffinity(getpid(), sizeof(cpu_set_t), &orig_mask);
-#endif
+		if (mapped) {
+			/* Already 4KB-mapped: the set must be ACCEPTED.
+			 * Prove it from the descriptor only - the page
+			 * itself stays untouched until it has been restored,
+			 * or this non-fatal case ends in a Data Abort.
+			 */
+
+			lldbg("AL NOACCESS_ABORT: page=0x%08x already 4KB-mapped (pte=0x%08x AP=%u), expecting the set to be accepted\n",
+			      page_addr, pte, (unsigned int)ap);
+
+			if (saved_pte == 0) {
+				lldbg("AL NOACCESS_ABORT: FAIL - no descriptor to restore\n");
+				kmm_free(buf);
+				ret = -EIO;
+				break;
+			}
+
+			MMU_TRY(mmu_set_page_no_access(page_addr));
+
+			if (mmu_get_page_pte_raw(page_addr, &pte, &ap) != OK ||
+			    ap != 0) {
+				lldbg("AL NOACCESS_ABORT: FAIL - not No-Access after set (pte=0x%08x AP=%u)\n",
+				      pte, (unsigned int)ap);
+				MMU_TRY(mmu_restore_page_pte(page_addr,
+				                             saved_pte));
+				kmm_free(buf);
+				ret = -EIO;
+				break;
+			}
+
+			lldbg("AL NOACCESS_ABORT: page is No-Access (pte=0x%08x AP=0), proven without touching it\n",
+			      pte);
+
+			MMU_TRY(mmu_restore_page_pte(page_addr, saved_pte));
+
+			if (mmu_get_page_pte_raw(page_addr, &pte, &ap) != OK ||
+			    pte != saved_pte) {
+				lldbg("AL NOACCESS_ABORT: FAIL - descriptor not restored (pte=0x%08x saved=0x%08x)\n",
+				      pte, saved_pte);
+				kmm_free(buf);
+				ret = -EIO;
+				break;
+			}
+
+			/* Reachable again - and only now may the page be
+			 * read */
+
+			val = ((volatile uint8_t *)page_addr)[0];
+
+			if (val != 0xAA || g_mmu_op_failures != ops_before) {
+				lldbg("AL NOACCESS_ABORT: FAIL - val=0x%02x (want 0xaa), statuses %d -> %d\n",
+				      val, ops_before, g_mmu_op_failures);
+				kmm_free(buf);
+				ret = -EIO;
+				break;
+			}
+
+			lldbg("AL NOACCESS_ABORT: PASS - 4KB-mapped: set accepted, AP=0 read back from the descriptor, page restored and readable (val=0x%02x)\n",
+			      val);
+			kmm_free(buf);
+			ret = OK;
+			break;
+		}
+
+		/* Still covered by a 1MB section: the refusal path,
+		 * unchanged */
+
+		lldbg("AL NOACCESS_ABORT: page=0x%08x is 1MB-section mapped, calling mmu_set_page_no_access(), expect -EINVAL\n",
+		      page_addr);
+
+		status = mmu_set_page_no_access(page_addr);
+
+		/* Refused: the descriptor was not touched, so this must not
+		 * fault */
+
+		val = ((volatile uint8_t *)page_addr)[0];
+
+		/* g_mmu_op_failures is a boot-wide counter, so it is compared
+		 * against its own value on entry: any case run before this one
+		 * may already have counted a refused status, and that is not
+		 * this case's failure.  What matters here is that the refused
+		 * call counted nothing new.
+		 */
+
+		if (status == -EINVAL && val == 0xAA &&
+		    g_mmu_op_failures == ops_before) {
+			lldbg("AL NOACCESS_ABORT: PASS - section refused (-EINVAL), memory intact (val=0x%02x)\n",
+			      val);
+			ret = OK;
+		} else {
+			lldbg("AL NOACCESS_ABORT: FAIL - set -> %d (want -EINVAL), val=0x%02x (want 0xaa), statuses %d -> %d\n",
+			      status, val, ops_before, g_mmu_op_failures);
+			ret = -EIO;
+		}
+
 		kmm_free(buf);
-		ret = -EIO;
 		break;
 	}
 #endif
@@ -953,7 +1228,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		(void)val;
 
 		lldbg("AL SPLIT_PROTECT: ERROR — access succeeded!\n");
-		mmu_restore_page_pte(page_addr, saved_pte);
+		MMU_TRY(mmu_restore_page_pte(page_addr, saved_pte));
 #ifdef CONFIG_SMP
 		sched_setaffinity(getpid(), sizeof(cpu_set_t), &orig_mask);
 #endif
@@ -1223,6 +1498,8 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		uint8_t *buf;
 		uint32_t page_addr;
 		uint32_t saved_pte;
+		uint32_t pte = 0;
+		uint8_t ap = 0xff;
 
 		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
 		if (!buf) {
@@ -1232,10 +1509,36 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		page_addr = ((uint32_t)buf + 4095) & ~4095u;
 		memset((void *)page_addr, 0xAA, 4096);
 
+		/* Split first: on a plain section the protect call is
+		 * refused and the round-trip below proves nothing. */
+
+		MMU_TRY(mmu_split_section_to_l2(page_addr));
+
 		saved_pte = mmu_save_page_pte(page_addr);
-		mmu_set_page_no_access(page_addr);
-		mmu_restore_page_pte(page_addr, saved_pte);
-		lldbg("AL RESTORE: protect+restore done, page accessible\n");
+		MMU_TRY(mmu_set_page_no_access(page_addr));
+
+		if (mmu_get_page_pte_raw(page_addr, &pte, &ap) != OK || ap != 0) {
+			lldbg("AL RESTORE: FAIL - not No-Access after set (pte=0x%08x AP=%u)\n",
+			      pte, (unsigned int)ap);
+			MMU_TRY(mmu_restore_page_pte(page_addr, saved_pte));
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+
+		MMU_TRY(mmu_restore_page_pte(page_addr, saved_pte));
+
+		if (mmu_get_page_pte_raw(page_addr, &pte, &ap) != OK ||
+		    pte != saved_pte) {
+			lldbg("AL RESTORE: FAIL - descriptor not restored (pte=0x%08x saved=0x%08x)\n",
+			      pte, saved_pte);
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+
+		lldbg("AL RESTORE: protect+restore done (pte=0x%08x), page accessible\n",
+		      pte);
 
 		((volatile uint8_t *)page_addr)[0] = 0xBB;
 		lldbg("AL RESTORE: write OK\n");
@@ -1250,6 +1553,8 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 	case TESTIOC_AL_SMP_SPLIT: {
 		uint8_t *buf;
 		uint32_t page_addr;
+		uint32_t pte = 0;
+		uint8_t ap = 0xff;
 
 		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
 		if (!buf) {
@@ -1258,11 +1563,109 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		}
 		page_addr = ((uint32_t)buf + 4095) & ~4095u;
 
-		mmu_split_section_to_l2(page_addr);
-		lldbg("AL SPLIT: section split, accessible\n");
+		MMU_TRY(mmu_split_section_to_l2(page_addr));
+
+		/* "No crash" was the whole test before, so a split that was
+		 * refused (L2 pool exhausted, bad address, section already
+		 * split) printed exactly the same PASS line.  MMU_TRY() only
+		 * counts and logs, it does not abort the case, so the L1
+		 * descriptor has to be read back and checked explicitly -
+		 * the way TC-AL-01 does it. */
+
+		if (mmu_get_page_pte_raw(page_addr, &pte, &ap) != OK) {
+			lldbg("AL SPLIT: FAIL - section is still not 4KB-mapped\n");
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
 
 		memset((void *)page_addr, 0xAA, 4096);
-		lldbg("AL SPLIT: write OK\n");
+		lldbg("AL SPLIT: write OK, now 4KB-mapped (pte=0x%08x AP=%u)\n",
+		      pte, (unsigned int)ap);
+
+		kmm_free(buf);
+		ret = OK;
+		break;
+	}
+
+	/* TC-AL-10: L2 pool accounting (Safe, single core).
+	 *
+	 * Coverage has to be known and not assumed: the pool is what bounds
+	 * how much address space can ever be page-protected, and until now a
+	 * split that was refused because it was empty looked exactly like a
+	 * split that succeeded.  What is asserted here is the no-leak
+	 * contract - one split costs at most one table, and splitting the
+	 * same section again costs none, so a repeated protect/init cannot
+	 * eat the pool. */
+	case TESTIOC_MMU_L2_POOL_USAGE: {
+		uint32_t total = 0;
+		uint32_t used  = mmu_l2_pool_usage(&total);
+		uint32_t held  = mmu_l2_pool_held();
+		uint32_t after;
+		uint32_t pok = 0;
+		uint32_t pskip = 0;
+		uint32_t pbudget = 0;
+		uint32_t saved = 0;
+		uint32_t saved_max = 0;
+		uint8_t *buf;
+		uint32_t page_addr;
+
+		lldbg("=== L2 POOL: %u of %u tables claimed, %u held for a protected region ===\n",
+		      used, total, held);
+
+		mmu_protect_get_counters(&pok, &pskip, &pbudget);
+		lldbg("L2 POOL: page-protect operations: ok=%u skipped=%u refused-for-budget=%u\n",
+		      pok, pskip, pbudget);
+
+		/* The save table, not the L2 pool, is what bounds how much
+		 * memory can be No-Access at one time: MM_PROTECT_SAVED_MAX
+		 * pages.  Without this line the first refused-for-budget
+		 * increment reads as a defect instead of a ceiling reached. */
+		saved = mmu_protect_saved_usage(&saved_max);
+		lldbg("L2 POOL: locked-page save table %u of %u pages (%u KB ceiling)\n",
+		      saved, saved_max, (unsigned int)(saved_max * 4));
+
+		buf = (uint8_t *)kmm_memalign(4096, 4096 * 2);
+		if (!buf) {
+			lldbg("L2 POOL: kmm_memalign failed\n");
+			return -ENOMEM;
+		}
+		page_addr = ((uint32_t)buf + 4095) & ~4095u;
+
+		/* First split: takes a table if the megabyte was still a
+		 * section, none if the heap had it split already.  Both
+		 * answers are correct, so the check is on the delta. */
+
+		MMU_TRY(mmu_split_section_to_l2(page_addr));
+		after = mmu_l2_pool_usage(NULL);
+
+		if (after != used && after != used + 1) {
+			lldbg("L2 POOL: FAIL - %u tables before, %u after one split\n",
+			      used, after);
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+
+		MMU_TRY(mmu_split_section_to_l2(page_addr));
+
+		if (mmu_l2_pool_usage(NULL) != after) {
+			lldbg("L2 POOL: FAIL - a repeated split of 0x%08x claimed another table\n",
+			      page_addr);
+			kmm_free(buf);
+			ret = -EIO;
+			break;
+		}
+
+		lldbg("L2 POOL: PASS - split of 0x%08x used %u table(s), pool %u/%u\n",
+		      page_addr, after - used, after, total);
+
+		if (after >= total) {
+			lldbg("L2 POOL: NOTE - pool exhausted, further splits now return -ENOMEM\n");
+		} else {
+			lldbg("L2 POOL: NOTE - the -ENOMEM branch needs a build with "
+			      "CONFIG_MMU_L2_POOL_TABLES=2 to be reachable\n");
+		}
 
 		kmm_free(buf);
 		ret = OK;
@@ -1307,7 +1710,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		*(volatile uint32_t *)r2_page = 0xDEADBEEF;
 
 		/* Not reached.  Restore defensively if the abort did not fire. */
-		mmu_restore_page_pte((uint32_t)r2_page, saved_pte);
+		MMU_TRY(mmu_restore_page_pte((uint32_t)r2_page, saved_pte));
 		ret = OK;
 		break;
 	}
@@ -1437,6 +1840,44 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 			res.op_cost_us = total / R3_PAIR_REPS;
 		}
 
+#ifdef CONFIG_WDOG_MMU_PROTECT
+		/* Phase E: average cost of one watchdog write window - open
+		 * and close the descriptor of the one protected page.  This is
+		 * what every wd_start()/wd_cancel() pays, so it is the number
+		 * that decides whether the protection is affordable.  Timed
+		 * under a critical section, as the callers hold one - but one
+		 * critical section per batch, not one per phase: the batch is
+		 * sized for the clock resolution, and holding interrupts off
+		 * across every batch would put ~10 ms of latency into the
+		 * timer and the serial path.  The enter/leave itself is one
+		 * operation per 1000 pairs, so it does not distort the
+		 * average.
+		 */
+		{
+			uint32_t total = 0;
+			irqstate_t win_irq;
+			int k;
+
+			for (i = 0; i < R3_PAIR_REPS / R3_PAIR_BATCH; i++) {
+				win_irq = enter_critical_section();
+
+				t0 = r3_now_us();
+				for (k = 0; k < R3_PAIR_BATCH; k++) {
+					MMU_TRYQ(wd_mmu_write_begin());
+					MMU_TRYQ(wd_mmu_write_end());
+				}
+
+				t1 = r3_now_us();
+
+				leave_critical_section(win_irq);
+
+				total += (t1 - t0);
+			}
+
+			res.window_pair_us = total / R3_PAIR_REPS;
+		}
+#endif
+
 		lldbg("R3: clock floor 1000us: C = avg of %u splits, D = avg of %u pairs\n",
 		      R3_SPLIT_REPS, R3_PAIR_REPS);
 
@@ -1446,8 +1887,46 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		lldbg("R3: overhead = %u%%   (R3 gate: < 10%%)\n", res.overhead_pct);
 		lldbg("R3: one runtime split = %u us (L2 fill + full TLB flush)\n",
 		      res.split_cost_us);
-		lldbg("R3: 8KB block protect+restore pair = %u us (4 TLB syncs)\n",
-		      res.op_cost_us);
+		/* Phase D and E are batch averages of operations that take
+		 * well under one clock tick, so a result below R3_TICK_US is
+		 * "not resolvable", not "measured at N us".  Say which. */
+
+		if (res.op_cost_us < R3_TICK_US) {
+			lldbg("R3: 8KB block protect+restore pair < %u us (below clock resolution - not a measured value)\n",
+			      (unsigned int)R3_TICK_US);
+		} else {
+			lldbg("R3: 8KB block protect+restore pair = %u us (4 TLB syncs)\n",
+			      res.op_cost_us);
+		}
+#ifdef CONFIG_WDOG_MMU_PROTECT
+		if (res.window_pair_us < R3_TICK_US) {
+			lldbg("R3: watchdog write window pair < %u us (below clock resolution - not a measured value)\n",
+			      (unsigned int)R3_TICK_US);
+		} else {
+			lldbg("R3: watchdog write window pair = %u us (1 descriptor, both cores)\n",
+			      res.window_pair_us);
+		}
+#endif
+		/* Budget state at the end of the sweep.  Both numbers are
+		 * one-way doors - an L2 table is never released and a locked
+		 * page stays locked until something restores it - so a soak
+		 * run has to report where it left the board (plan risk R6). */
+		{
+			uint32_t ptotal = 0;
+			uint32_t smax = 0;
+
+			res.pool_claimed = mmu_l2_pool_usage(&ptotal);
+			res.pool_total = ptotal;
+			res.pool_held = mmu_l2_pool_held();
+			res.saved_used = mmu_protect_saved_usage(&smax);
+			res.saved_max = smax;
+
+			lldbg("R3: budget after: pool %u of %u tables claimed, %u held; save table %u of %u pages (%u KB ceiling)\n",
+			      res.pool_claimed, res.pool_total, res.pool_held,
+			      res.saved_used, res.saved_max,
+			      (unsigned int)(res.saved_max * 4));
+		}
+
 		lldbg("R3: L2 tables consumed by working set = %u\n",
 		      res.sections_split);
 		if (res.overhead_pct < 10) {
@@ -1473,13 +1952,13 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 	 * 4: FATAL - deliberate write to a freed, protected block */
 #ifdef CONFIG_MM_HEAP_UAF_PROTECT
 	case TESTIOC_MMU_HEAP_PROTECT_STRESS: {
-		int phase = (int)arg;
+		int phase = (int)arg & 0xff;
+		uint32_t minutes = (uint32_t)((unsigned int)arg >> 8);
 		FAR uint8_t *mem;
 		uintptr_t pg;
 		uint32_t cok;
 		uint32_t cskip;
 		uint32_t cfail;
-		int i;
 
 		lldbg("=== TC-R4: heap UAF-protect stress (phase %d) ===\n", phase);
 
@@ -1515,8 +1994,104 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		}
 
 		mmu_protect_get_counters(&cok, &cskip, &cfail);
-		lldbg("R4: counters: ok=%u skipped=%u failed_budget=%u\n",
-		      cok, cskip, cfail);
+		lldbg("R4: counters: ok=%u skipped=%u failed_budget=%u coverage=%u%%\n",
+		      cok, cskip, cfail,
+		      R4_COVERAGE(cok, cskip));
+
+		if (phase == 5) {
+			/* M4 endurance: `heap_protect 5 <minutes>`.  Reuses
+			 * the mixed-size churn, plus an hourly core-1 churn
+			 * under SMP, inside a wall-clock deadline; prints
+			 * coverage deltas every minute and never issues a
+			 * fatal write.  Exit criterion: survive the whole
+			 * deadline with no abort and no failed_budget growth
+			 * (and with the R6 warning never fired). */
+			struct timespec ts;
+			time_t start_s;
+			time_t deadline_s;
+			time_t next_report;
+			uint32_t ok0;
+			uint32_t skip0;
+			uint32_t fail0;
+			uint32_t rounds = 0;
+#ifdef CONFIG_SMP
+			time_t next_smp;
+#endif
+
+			if (minutes == 0) {
+				minutes = 1;
+			}
+
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			start_s = ts.tv_sec;
+			deadline_s = ts.tv_sec + (time_t)minutes * 60;
+			next_report = ts.tv_sec + 60;
+#ifdef CONFIG_SMP
+			next_smp = ts.tv_sec + 60;
+#endif
+			mmu_protect_get_counters(&ok0, &skip0, &fail0);
+			lldbg("R4/5: endurance start: %u minutes\n",
+			      (unsigned int)minutes);
+
+			do {
+				r4_mixed_churn(100);
+				rounds++;
+				clock_gettime(CLOCK_MONOTONIC, &ts);
+
+#ifdef CONFIG_SMP
+				if (ts.tv_sec >= next_smp &&
+				    ts.tv_sec < deadline_s) {
+					pid_t pid1;
+					int wait_count = 0;
+
+					next_smp = ts.tv_sec + 60;
+					g_r4_core1_done = 0;
+					pid1 = kernel_thread("r4_core1",
+							     100, 4096,
+							     r4_core1_churn,
+							     NULL);
+					if (pid1 >= 0) {
+						cpu_set_t cpu_mask;
+
+						CPU_ZERO(&cpu_mask);
+						CPU_SET(1, &cpu_mask);
+						sched_setaffinity(pid1,
+							sizeof(cpu_set_t),
+							&cpu_mask);
+						while (!g_r4_core1_done &&
+						       wait_count < 5000) {
+							usleep(10 * 1000);
+							wait_count++;
+						}
+					}
+				}
+#endif
+
+				if (ts.tv_sec >= next_report) {
+					uint32_t c1;
+					uint32_t s1;
+					uint32_t f1;
+
+					next_report = ts.tv_sec + 60;
+					mmu_protect_get_counters(&c1, &s1,
+								  &f1);
+					lldbg("R4/5: +%ld min ok=+%u skipped=+%u failed_budget=+%u\n",
+					      (long)(ts.tv_sec - start_s) / 60,
+					      (unsigned int)(c1 - ok0),
+					      (unsigned int)(s1 - skip0),
+					      (unsigned int)(f1 - fail0));
+				}
+			} while (ts.tv_sec < deadline_s);
+
+			mmu_protect_get_counters(&cok, &cskip, &cfail);
+			lldbg("R4/5: ENDURANCE DONE %u min rounds=%u ok=+%u skipped=+%u failed_budget=+%u\n",
+			      (unsigned int)minutes, (unsigned int)rounds,
+			      (unsigned int)(cok - ok0),
+			      (unsigned int)(cskip - skip0),
+			      (unsigned int)(cfail - fail0));
+			ret = OK;
+			break;
+		}
 
 		if (phase < 2) {
 			ret = OK;
@@ -1526,26 +2101,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		/* Step 2: mixed churn - allocator must never fault on the
 		 * pages it just unlocked (hook-ordering proof) */
 		lldbg("R4/2: mixed-size churn (100 iterations)...\n");
-		for (i = 0; i < 100; i++) {
-			FAR uint8_t *a = (FAR uint8_t *)kmm_malloc(4096);
-			FAR uint8_t *b = (FAR uint8_t *)kmm_malloc(5120);
-			FAR uint8_t *c = (FAR uint8_t *)kmm_malloc(64 * 1024);
-
-			if (a) {
-				a[0] = (uint8_t)i;
-				a[4095] = (uint8_t)i;
-			}
-			if (b) {
-				b[0] = (uint8_t)i;
-			}
-			if (c) {
-				c[0] = (uint8_t)i;
-				c[65535] = (uint8_t)i;
-			}
-			kmm_free(a);
-			kmm_free(b);
-			kmm_free(c);
-		}
+		r4_mixed_churn(100);
 		lldbg("R4/2: PASS churn completed, no abort\n");
 
 		if (phase < 3) {
@@ -1587,8 +2143,9 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 #endif /* CONFIG_SMP */
 
 		mmu_protect_get_counters(&cok, &cskip, &cfail);
-		lldbg("R4: counters: ok=%u skipped=%u failed_budget=%u\n",
-		      cok, cskip, cfail);
+		lldbg("R4: counters: ok=%u skipped=%u failed_budget=%u coverage=%u%%\n",
+		      cok, cskip, cfail,
+		      R4_COVERAGE(cok, cskip));
 
 		if (phase < 4) {
 			ret = OK;
@@ -1627,71 +2184,106 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 
 #ifdef CONFIG_EXAMPLES_MMU_PROTECT_TEST
 	case TESTIOC_WDOG_MMU_PROTECT_TEST: {
-		/* Verify watchdog MMU page protection.
+#ifndef CONFIG_WDOG_MMU_PROTECT
+		lldbg("WDOG PROT: SKIP - CONFIG_WDOG_MMU_PROTECT is not enabled\n");
+		ret = -ENOSYS;
+		break;
+#else
+		/* Verify the watchdog page protection by judging the descriptor,
+		 * not by judging whether a write survived:
 		 *
-		 * This test accesses the wdog static data page (g_wdpool) from
-		 * OUTSIDE wdog code — i.e. without calling wd_mmu_write_begin().
+		 *   1. the whole watchdog data block must be read-only while no
+		 *      window is open;
+		 *   2. the pool, both list heads and the free counter must all
+		 *      be writable inside ONE window, and the block read-only
+		 *      again once that window is closed - that is the claim of
+		 *      one descriptor over one page;
+		 *   3. arg = 1: write from outside any window.  That has to
+		 *      fault, so this variant is fatal by design when the
+		 *      protection works and is only reached deliberately.
 		 *
-		 * Step 1: Read from the wdog page — should succeed (page is
-		 *         Read-Only, reads are allowed).
-		 * Step 2: Write to the wdog page — if CONFIG_WDOG_MMU_PROTECT
-		 *         is enabled, the MMU triggers a Data Abort (permission
-		 *         fault).  DFAR will contain the wdog page address.
-		 *
-		 * If protection is NOT enabled, the write succeeds but we
-		 * immediately restore the original value (with interrupts
-		 * disabled so no timer interrupt sees the corruption).
-		 *
-		 * arg = 0: read only (safe, no crash)
-		 * arg = 1: write (crash if protection enabled)
+		 * A write that goes through with the protection installed is a
+		 * failure here, not a configuration report: the old body read a
+		 * successful write as "CONFIG_WDOG_MMU_PROTECT is NOT enabled",
+		 * which let this case pass with the protection installed but
+		 * not working.
 		 */
-		volatile uint8_t *wdog_page = (volatile uint8_t *)&g_wdpool;
-		int do_write = (arg == 1);
+
+		volatile uint8_t *pool      = (volatile uint8_t *)&g_wdog_data.core.pool[0];
+		volatile uint8_t *free_head = (volatile uint8_t *)&g_wdog_data.core.freelist.head;
+		volatile uint8_t *act_head  = (volatile uint8_t *)&g_wdog_data.core.activelist.head;
+		volatile uint8_t *nfree     = (volatile uint8_t *)&g_wdog_data.core.nfree;
+		bool open = false;
+		uint8_t cpu = 0xff;
+		uint8_t depth = 0;
 		irqstate_t irq_state;
 
-		lldbg("WDOG MMU protect test: wdog data at 0x%08x\n",
-		      (uint32_t)wdog_page);
-		/* Step 1: Read — should always succeed (Read-Only allows reads) */
-		lldbg("WDOG MMU protect test: reading wdog page (should succeed)...\n");
-		volatile uint8_t val = wdog_page[0];
-		lldbg("WDOG MMU protect test: read OK, val = 0x%02x\n", val);
+		lldbg("=== WDOG MMU protect: data 0x%08x, %u bytes ===\n",
+		      (uint32_t)(uintptr_t)&g_wdog_data,
+		      (unsigned int)sizeof(g_wdog_data));
 
-		if (do_write) {
-			/* Step 2: Write — if CONFIG_WDOG_MMU_PROTECT is enabled,
-			 * this triggers a Data Abort.  The page is Read-Only and
-			 * we are NOT inside wd_mmu_write_begin()/wd_mmu_write_end().
-			 *
-			 * DFAR will contain &g_wdpool — the protected wdog address.
-			 *
-			 * If protection is NOT enabled, the write succeeds.  We
-			 * disable interrupts and save/restore the original byte
-			 * so the wdog data is not permanently corrupted.  Without
-			 * interrupts, no timer tick can fire between the write
-			 * and the restore.
-			 */
-			lldbg("WDOG MMU protect test: >>> WRITE to wdog page, expect Data Abort <<<\n");
-
-			irq_state = enter_critical_section();
-			uint8_t orig = wdog_page[0];
-			wdog_page[0] = 0xBB;
-
-			/* If we reach here, protection is NOT enabled.
-			 * Restore the original value to avoid corrupting wdog data.
-			 */
-			wdog_page[0] = orig;
-			leave_critical_section(irq_state);
-
-			lldbg("WDOG MMU protect test: write succeeded (value restored), no Data Abort!\n");
-			lldbg("WDOG MMU protect test: CONFIG_WDOG_MMU_PROTECT is NOT enabled.\n");
-			lldbg("WDOG MMU protect test: Wdog page is writable — protection is OFF.\n");
-			ret = OK;
-
-		} else {
-			lldbg("WDOG MMU protect test: read-only test passed.\n");
-			lldbg("WDOG MMU protect test: use arg=1 to test write protection (crash).\n");
-			ret = OK;
+		wd_mmu_get_window_state(&open, &cpu, &depth);
+		if (open) {
+			lldbg("WDOG PROT: FAIL - a window is already open (cpu%u depth%u)\n",
+			      (unsigned int)cpu, (unsigned int)depth);
+			ret = -EBUSY;
+			break;
 		}
+
+		if (!wd_mmu_is_protected()) {
+			lldbg("WDOG PROT: FAIL - the data page is writable with no window open\n");
+			ret = -EIO;
+			break;
+		}
+
+		/* Reads are allowed on a read-only page */
+
+		lldbg("WDOG PROT: read-only with no window open, pool[0] = 0x%02x\n",
+		      pool[0]);
+
+		/* One window, four objects.  Each write stores the value it
+		 * just read, so the queue state is unchanged either way. */
+
+		irq_state = enter_critical_section();
+
+		if (wd_mmu_write_begin() != OK) {
+			leave_critical_section(irq_state);
+			lldbg("WDOG PROT: FAIL - write window could not be opened\n");
+			ret = -EIO;
+			break;
+		}
+
+		*pool      = *pool;
+		*free_head = *free_head;
+		*act_head  = *act_head;
+		*nfree     = *nfree;
+
+		(void)wd_mmu_write_end();
+		leave_critical_section(irq_state);
+
+		lldbg("WDOG PROT: pool, freelist, activelist, nfree all written in one window\n");
+
+		if (!wd_mmu_is_protected()) {
+			lldbg("WDOG PROT: FAIL - the page is still writable after the last end()\n");
+			ret = -EIO;
+			break;
+		}
+
+		if (arg == 1) {
+			lldbg("WDOG PROT: >>> write outside any window, expect Data Abort <<<\n");
+			*pool = 0xbb;
+
+			/* Not reached when the protection works */
+
+			lldbg("WDOG PROT: FAIL - the write went through, protection is not in force\n");
+			ret = -EIO;
+			break;
+		}
+
+		lldbg("WDOG PROT: PASS - one page, one descriptor, both cores (pass 1 for the fault case)\n");
+		ret = OK;
 		break;
+#endif
 	}
 
 #endif
@@ -1699,198 +2291,299 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 #ifdef CONFIG_WDOG_MMU_DEFECT_TEST
 
 	case TESTIOC_WDOG_DEFECT_SMP: {
-		/* Defect #1: SMP DACR per-core issue.
+		/* Defect #1: "writes are allowed" has to be one state for the
+		 * whole system, not one per core.
 		 *
-		 * DACR is a per-CPU register. When wd_mmu_write_begin() runs
-		 * on Core 0, only Core 0's DACR is updated to Manager (RW).
-		 * Core 1's DACR remains Client (RO). If Core 1 accesses the
-		 * wdog pool, it gets a Data Abort.
+		 * The old mechanism changed a per-CPU register (DACR), so the
+		 * state meant something different on each core: a core that was
+		 * not the one that called wd_mmu_write_begin() faulted on its
+		 * first write, and after that core finished, a core still
+		 * inside its own window could not tell.
 		 *
-		 * This test:
-		 * 1. Reads DACR before begin() (should be RO = 0x05)
-		 * 2. Calls wd_mmu_write_begin() (sets this core's DACR = RW)
-		 * 3. Reads DACR after begin() (should be RW = 0x0D)
-		 * 4. Writes to wdog pool from this core (should succeed)
-		 * 5. Logs that other cores' DACR is still RO (defect!)
-		 *
-		 * On SMP: if another core accesses wdog pool now → Data Abort.
+		 * The state is now the descriptor of one page, which both cores
+		 * walk.  What this test checks:
+		 *   - the page really is read-only before the window opens;
+		 *   - opening the window makes it writable, reports this core
+		 *     as the owner and one level deep, and the write succeeds;
+		 *   - closing it puts the page back to read-only, with the
+		 *     invalidation broadcast so the other core sees it too.
 		 */
-		uint32_t dacr_before, dacr_after;
 		volatile uint8_t *wdog_page = (volatile uint8_t *)&g_wdpool;
+		bool win_open = true;
+		uint8_t win_cpu = 0xff;
+		uint8_t win_depth = 0;
+		uint32_t pte = 0;
+		uint8_t ap = 0xff;
+		irqstate_t irq_state;
+		uint8_t orig;
 
-		lldbg("=== DEFECT #1: SMP DACR per-core test ===\n");
+		lldbg("=== DEFECT #1: one protection state for both cores ===\n");
 
-		/* Step 1: Read DACR before begin() */
-		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr_before));
-		lldbg("DEFECT_SMP: DACR before begin() = 0x%08x (expect 0x05 = RO)\n", dacr_before);
+		wd_mmu_get_window_state(&win_open, &win_cpu, &win_depth);
+		lldbg("DEFECT_SMP: before: window=%s cpu%u depth%u\n",
+		      win_open ? "OPEN" : "closed",
+		      (unsigned int)win_cpu, (unsigned int)win_depth);
 
-		/* Step 2: Call begin() — sets THIS core's DACR = RW */
-		wd_mmu_write_begin();
-
-		/* Step 3: Read DACR after begin() */
-		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr_after));
-		lldbg("DEFECT_SMP: DACR after begin()  = 0x%08x (expect 0x0D = RW)\n", dacr_after);
-
-		if (dacr_after == 0x0000000d) {
-			lldbg("DEFECT_SMP: This core DACR = RW (Manager) — write should succeed\n");
+		if (mmu_get_page_pte_raw((uint32_t)(uintptr_t)wdog_page, &pte, &ap) == OK) {
+			lldbg("DEFECT_SMP: before: pte=0x%08x AP=%u (%s)\n", pte,
+			      (unsigned int)ap,
+			      ap == 0 ? "NO ACCESS" :
+			      (ap & 2) ? "READ-ONLY" : "READ-WRITE");
 		} else {
-			lldbg("DEFECT_SMP: ERROR — This core DACR NOT 0x0D!\n");
+			lldbg("DEFECT_SMP: watchdog page is not 4KB-mapped!\n");
 		}
 
-		/* Step 4: Write to wdog pool from this core (should succeed) */
-		lldbg("DEFECT_SMP: Writing to wdog pool from this core...\n");
-		{
-			irqstate_t irq_state = enter_critical_section();
-			uint8_t orig = wdog_page[0];
-			wdog_page[0] = 0xCC;
-			wdog_page[0] = orig;
+		irq_state = enter_critical_section();
+
+		if (wd_mmu_write_begin() != OK) {
 			leave_critical_section(irq_state);
+			lldbg("DEFECT_SMP: FAIL - could not open the write window\n");
+			ret = ERROR;
+			break;
 		}
-		lldbg("DEFECT_SMP: Write succeeded on this core (DACR = RW)\n");
 
-		/* Step 5: Log the defect */
-		lldbg("DEFECT_SMP: === DEFECT CONFIRMED ===\n");
-		lldbg("DEFECT_SMP: Other cores' DACR is still 0x05 (RO)!\n");
-		lldbg("DEFECT_SMP: If another core accesses wdog pool now → Data Abort!\n");
-		lldbg("DEFECT_SMP: Fix: Use IPI to broadcast DACR to all cores.\n");
+		wd_mmu_get_window_state(&win_open, &win_cpu, &win_depth);
+		lldbg("DEFECT_SMP: inside: window=%s cpu%u depth%u\n",
+		      win_open ? "OPEN" : "closed",
+		      (unsigned int)win_cpu, (unsigned int)win_depth);
 
-		wd_mmu_write_end();
+		if (mmu_get_page_pte_raw((uint32_t)(uintptr_t)wdog_page, &pte, &ap) == OK) {
+			lldbg("DEFECT_SMP: inside: pte=0x%08x AP=%u (%s)\n", pte,
+			      (unsigned int)ap,
+			      ap == 0 ? "NO ACCESS" :
+			      (ap & 2) ? "READ-ONLY" : "READ-WRITE");
+		}
 
-		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr_after));
-		lldbg("DEFECT_SMP: DACR after end()   = 0x%08x (expect 0x05 = RO)\n", dacr_after);
+		orig = wdog_page[0];
+		wdog_page[0] = orig;
 
-		ret = OK;
+		lldbg("DEFECT_SMP: write succeeded on this core while open\n");
+
+		MMU_TRY(wd_mmu_write_end());
+		leave_critical_section(irq_state);
+
+		wd_mmu_get_window_state(&win_open, &win_cpu, &win_depth);
+
+		if (mmu_get_page_pte_raw((uint32_t)(uintptr_t)wdog_page, &pte, &ap) == OK) {
+			lldbg("DEFECT_SMP: after:  window=%s pte=0x%08x AP=%u (%s)\n",
+			      win_open ? "OPEN" : "closed", pte, (unsigned int)ap,
+			      ap == 0 ? "NO ACCESS" :
+			      (ap & 2) ? "READ-ONLY" : "READ-WRITE");
+		}
+
+		/* The descriptor is the state, so it decides the verdict: the
+		 * ioctl has to carry it, otherwise this case printed FAIL and
+		 * still reported OK to the shell. */
+
+		if (!win_open && (ap & 2)) {
+			lldbg("DEFECT_SMP: PASS - read-only again, both cores see it\n");
+			ret = OK;
+		} else {
+			lldbg("DEFECT_SMP: FAIL - page still writable after end()\n");
+			ret = -EIO;
+		}
+
 		break;
 	}
 
 	case TESTIOC_WDOG_DEFECT_DSB: {
-		/* Defect #3: Missing dsb after DACR write.
+		/* Defect #3: a permission change has to be visible to the next
+		 * access, on this core and on the other one.
 		 *
-		 * Without a dsb (Data Synchronization Barrier) after the
-		 * mcr instruction that writes DACR, an out-of-order core
-		 * may execute the next memory access BEFORE the DACR write
-		 * completes. This causes an intermittent Data Abort.
+		 * Changing a page-table entry is not enough on its own: the
+		 * entry has to reach RAM, the stale copy in the data cache has
+		 * to go, and the address has to leave the TLB of both cores -
+		 * otherwise the access that follows the change is translated by
+		 * the old entry, and the fault, if any, lands somewhere else.
 		 *
-		 * This test calls wd_mmu_write_begin() and immediately
-		 * writes to the wdog pool in a tight loop (10,000 iterations).
-		 * Without dsb, intermittent failures may occur on
-		 * out-of-order cores.
+		 * The barriers and the invalidation are the arch layer's job
+		 * (mmu_restore_page_pte); this test hammers the window open and
+		 * closed 10,000 times with a write in between and then checks
+		 * that the state is still consistent.
 		 */
 		volatile uint8_t *wdog_page = (volatile uint8_t *)&g_wdpool;
+		bool win_open = true;
+		uint8_t win_cpu = 0xff;
+		uint8_t win_depth = 0;
+		irqstate_t irq_state;
+		int ops_before = g_mmu_op_failures;
 		int i;
 
-		lldbg("=== DEFECT #3: Missing dsb after DACR write ===\n");
-		lldbg("DEFECT_DSB: Running 10,000 iterations of begin()+write+end()\n");
-		lldbg("DEFECT_DSB: Without dsb, intermittent Data Abort may occur\n");
+		lldbg("=== DEFECT #3: barriers after the permission change ===\n");
+		lldbg("DEFECT_DSB: Running 10,000 iterations of open+write+close\n");
 
 		for (i = 0; i < 10000; i++) {
-			wd_mmu_write_begin();
-			/* Immediately write — without dsb, this may use stale DACR */
-			uint8_t orig = wdog_page[0];
-			wdog_page[0] = (uint8_t)(i & 0xFF);
-			wdog_page[0] = orig;
-			wd_mmu_write_end();
+			irq_state = enter_critical_section();
+			MMU_TRYQ(wd_mmu_write_begin());
+
+			/* Immediately write — no slack of any kind between the
+			 * descriptor change and the access */
+
+			*wdog_page = *wdog_page;
+
+			MMU_TRYQ(wd_mmu_write_end());
+			leave_critical_section(irq_state);
 		}
 
+		wd_mmu_get_window_state(&win_open, &win_cpu, &win_depth);
+
 		lldbg("DEFECT_DSB: All 10,000 iterations completed (no Data Abort)\n");
-		lldbg("DEFECT_DSB: NOTE: On out-of-order cores, this may fail intermittently\n");
-		lldbg("DEFECT_DSB: Fix: Add dsb + isb after mcr to DACR\n");
+		lldbg("DEFECT_DSB: window after the loop: %s depth%u\n",
+		      win_open ? "OPEN (FAIL)" : "closed", (unsigned int)win_depth);
+
+		/* 10,000 windows have to leave the bookkeeping exactly as
+		 * they found it: closed, zero deep, and no status refused on
+		 * the way.  Without this the case reported OK whatever it
+		 * printed. */
 
 		ret = OK;
+		if (win_open || win_depth != 0 || g_mmu_op_failures != ops_before) {
+			lldbg("DEFECT_DSB: FAIL - window or counters dirty (depth=%u statuses=%d)\n",
+			      (unsigned int)win_depth, g_mmu_op_failures);
+			ret = -EIO;
+		}
+
 		break;
 	}
 
-	case TESTIOC_WDOG_DEFECT_DACR_CLOBBER: {
-		/* Defect #7: DACR clobbers other domains.
+	case TESTIOC_WDOG_DEFECT_DOMAIN_KEEP: {
+		/* Defect #7: protecting the watchdogs must not touch the domain
+		 * register at all.
 		 *
-		 * wd_mmu_write_begin() writes the entire DACR register
-		 * (0x0D), which sets ALL 16 domains. Domains 2-15 are
-		 * set to No-Access (00), clobbering any other subsystem
-		 * that might use those domains.
+		 * The old mechanism rewrote DACR to switch the pool between
+		 * Client and Manager, which is a whole-CPU register: it also
+		 * decided how every other domain behaves, and domains that the
+		 * watchdog code knew nothing about were reset to No-Access
+		 * around every write.
 		 *
-		 * This test:
-		 * 1. Manually sets Domain 2 to Client (01)
-		 * 2. Calls wd_mmu_write_begin() (overwrites entire DACR)
-		 * 3. Reads DACR — Domain 2 is now No-Access (clobbered!)
+		 * The protection now only changes one page-table descriptor, so
+		 * DACR has to be identical before and after a window.  Domain 2
+		 * is claimed here as a stand-in for "somebody else's domain".
 		 */
-		uint32_t dacr;
+		uint32_t dacr_before;
+		uint32_t dacr_after;
+		irqstate_t irq_state;
 
-		lldbg("=== DEFECT #7: DACR clobbers other domains ===\n");
+		lldbg("=== DEFECT #7: the protection leaves the domain register alone ===\n");
 
-		/* Step 1: Set Domain 2 to Client (bits [5:4] = 01) */
-		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr));
-		dacr &= ~(0x3 << 4);    /* Clear Domain 2 bits */
-		dacr |= (0x1 << 4);     /* Set Domain 2 = Client */
-		__asm__ volatile("mcr p15, 0, %0, c3, c0, 0" :: "r"(dacr) : "memory");
+		/* Claim Domain 2 as Client (bits [5:4] = 01), the way any other
+		 * subsystem using a domain of its own would. */
 
-		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr));
-		lldbg("DEFECT_CLOBBER: Before begin(): DACR = 0x%08x (Domain 2 = Client)\n", dacr);
+		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr_before));
+		dacr_before &= ~(0x3 << 4);
+		dacr_before |= (0x1 << 4);
+		__asm__ volatile("mcr p15, 0, %0, c3, c0, 0" :: "r"(dacr_before) : "memory");
+		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr_before));
 
-		/* Step 2: Call begin() — overwrites entire DACR */
-		wd_mmu_write_begin();
+		lldbg("DEFECT_DOMAIN: DACR before window = 0x%08x (dom0=%u dom2=%u)\n",
+		      dacr_before, dacr_before & 0x3, (dacr_before >> 4) & 0x3);
 
-		/* Step 3: Read DACR — Domain 2 should be clobbered to No-Access */
-		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr));
-		lldbg("DEFECT_CLOBBER: After begin():  DACR = 0x%08x\n", dacr);
+		irq_state = enter_critical_section();
+		MMU_TRY(wd_mmu_write_begin());
+		MMU_TRY(wd_mmu_write_end());
+		leave_critical_section(irq_state);
 
-		uint32_t domain2 = (dacr >> 4) & 0x3;
-		if (domain2 == 0x0) {
-			lldbg("DEFECT_CLOBBER: === DEFECT CONFIRMED ===\n");
-			lldbg("DEFECT_CLOBBER: Domain 2 = No-Access (clobbered!)\n");
-			lldbg("DEFECT_CLOBBER: wd_mmu_write_begin() overwrote entire DACR\n");
-			lldbg("DEFECT_CLOBBER: Fix: Use read-modify-write for DACR\n");
+		__asm__ volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(dacr_after));
+
+		lldbg("DEFECT_DOMAIN: DACR after  window = 0x%08x (dom0=%u dom2=%u)\n",
+		      dacr_after, dacr_after & 0x3, (dacr_after >> 4) & 0x3);
+
+		if (dacr_after != dacr_before) {
+			lldbg("DEFECT_DOMAIN: FAIL - watchdog protection modified DACR\n");
+			ret = -EIO;
+		} else if ((dacr_after & 0x3) != 1) {
+			/* Domain 0 must stay Client: with Manager, the AP bits
+			 * of every page - including the watchdog page - are
+			 * ignored and no protection works at all. */
+
+			lldbg("DEFECT_DOMAIN: FAIL - domain 0 is not Client (0x%x), AP bits ignored\n",
+			      dacr_after & 0x3);
+			ret = -EIO;
 		} else {
-			lldbg("DEFECT_CLOBBER: Domain 2 = 0x%x (not clobbered)\n", domain2);
+			lldbg("DEFECT_DOMAIN: PASS - DACR untouched, domain 0 still Client\n");
+			ret = OK;
 		}
 
-		wd_mmu_write_end();
-
-		ret = OK;
 		break;
 	}
 
 	case TESTIOC_WDOG_DEFECT_HEAP_OVERLAP: {
-		/* Defect #8: Heap overlap with wdog pool.
+		/* Defect #8: Heap overlap with the watchdog data page.
 		 *
-		 * The wdog pool is placed at a fixed address. If the kernel
-		 * heap covers this region, heap allocations may land in the
-		 * wdog pool's Read-Only section → Data Abort.
+		 * The watchdog data sits in .bss now, inside the region the
+		 * linker already reserves for it, so the allocator cannot hand
+		 * it out - but a wrong section size would make the page cover
+		 * other data (or be covered by it), and that is visible here:
+		 * the range must be one page, aligned, and below the heap.
 		 *
-		 * This test prints the wdog pool address range and the
-		 * configured heap start address so the user can verify
-		 * there is no overlap.
+		 * This test prints the watchdog page range and the configured
+		 * RAM range so the layout can be checked from the log.
 		 */
-		extern uint32_t __wdog_pool_start__[];
-		extern uint32_t __wdog_pool_end__[];
+		extern uint32_t _wdog_data_start[];
+		extern uint32_t _wdog_data_end[];
 
-		uint32_t pool_start = (uint32_t)__wdog_pool_start__;
-		uint32_t pool_end = (uint32_t)__wdog_pool_end__;
+		uint32_t pool_start = (uint32_t)_wdog_data_start;
+		uint32_t pool_end = (uint32_t)_wdog_data_end;
 
-		lldbg("=== DEFECT #8: Heap overlap with wdog pool ===\n");
-		lldbg("DEFECT_HEAP: wdog pool: 0x%08x - 0x%08x (size = %d bytes)\n",
+		lldbg("=== DEFECT #8: Heap overlap with wdog data page ===\n");
+		lldbg("DEFECT_HEAP: wdog data page: 0x%08x - 0x%08x (size = %d bytes)\n",
 		      pool_start, pool_end, pool_end - pool_start);
+		lldbg("DEFECT_HEAP: 4KB aligned = %s, within one page = %s\n",
+		      (pool_start & 0xfff) ? "NO" : "yes",
+		      (pool_end - pool_start) <= 4096 ? "yes" : "NO");
 
-		/* Use CONFIG_RAM_KREGIONx_START for heap start check.
-		 * The heap start is configured via Kconfig and available
-		 * as a string. We compare against the wdog pool range.
+		/* What is being compared here is the watchdog page against
+		 * the ranges the allocator actually owns.  The previous check
+		 * asked whether the page lies inside
+		 * CONFIG_RAM_START..+CONFIG_RAM_SIZE, which on rtl8730e
+		 * covers every DDR address: it could only ever answer "defect
+		 * confirmed" (observed: pool at 0x60131000, RAM range
+		 * 0x60000000..0x68000000, so the case failed on a healthy
+		 * configuration).  mm_heapstart[]/mm_heapend[] are the
+		 * boundaries mm_addregion() published, which is what kmm_free()
+		 * can ever touch.
 		 */
-		lldbg("DEFECT_HEAP: Configured RAM start = 0x%08x\n", CONFIG_RAM_START);
-		lldbg("DEFECT_HEAP: Configured RAM size = %d bytes\n", CONFIG_RAM_SIZE);
-		lldbg("DEFECT_HEAP: RAM end = 0x%08x\n", CONFIG_RAM_START + CONFIG_RAM_SIZE);
+		{
+			FAR struct mm_heap_s *heap = kmm_get_baseheap();
+			int nregions = 1;
+			bool overlap = false;
+			int r;
 
-		/* Check if wdog pool is within RAM region */
-		if (pool_start >= CONFIG_RAM_START &&
-		    pool_start < (CONFIG_RAM_START + CONFIG_RAM_SIZE)) {
-			lldbg("DEFECT_HEAP: === DEFECT CONFIRMED ===\n");
-			lldbg("DEFECT_HEAP: wdog pool (0x%08x) is within RAM region!\n",
-			      pool_start);
-			lldbg("DEFECT_HEAP: Heap may overlap wdog pool → Data Abort risk!\n");
-			lldbg("DEFECT_HEAP: Fix: Adjust heap start to after wdog pool\n");
-		} else {
-			lldbg("DEFECT_HEAP: wdog pool is outside RAM region — OK\n");
+#if CONFIG_KMM_REGIONS > 1
+			nregions = heap->mm_nregions;
+			if (nregions < 1) {
+				nregions = 1;
+			}
+#endif
+
+			for (r = 0; r < nregions; r++) {
+				uint32_t hs = (uint32_t)(uintptr_t)heap->mm_heapstart[r];
+				uint32_t he = (uint32_t)(uintptr_t)heap->mm_heapend[r];
+
+				/* mm_heapend[] is the address of the end
+				 * node, i.e. the last node inside the region;
+				 * comparing against it is conservative by one
+				 * node, which is the right direction for a
+				 * "can the allocator reach my page" test. */
+
+				lldbg("DEFECT_HEAP: kernel heap region %d: 0x%08x - 0x%08x\n",
+				      r, hs, he);
+
+				if (pool_start < he && hs < pool_end) {
+					overlap = true;
+				}
+			}
+
+			if (overlap) {
+				lldbg("DEFECT_HEAP: === DEFECT CONFIRMED ===\n");
+				lldbg("DEFECT_HEAP: a heap region intersects the wdog page!\n");
+				lldbg("DEFECT_HEAP: the allocator can hand out protected memory\n");
+				ret = -EIO;
+			} else {
+				lldbg("DEFECT_HEAP: no heap region intersects the wdog page - OK\n");
+				ret = OK;
+			}
 		}
-
-		ret = OK;
 		break;
 	}
 
@@ -1914,6 +2607,10 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		 * unrelated to MMU protection.
 		 */
 		WDOG_ID wdog;
+		uint32_t fails_before = wd_mmu_get_failures();
+		bool win_open = false;
+		uint8_t win_cpu = 0xff;
+		uint8_t win_depth = 0;
 
 		lldbg("=== DEFECT #11: wd_recover() missing protection ===\n");
 		lldbg("DEFECT_RECOVER: Testing wd_recover() with MMU protection\n");
@@ -1945,35 +2642,164 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		wd_delete(wdog);
 
 		lldbg("DEFECT_RECOVER: wd_cancel() + wd_delete() completed — no Data Abort\n");
-		lldbg("DEFECT_RECOVER: wd_recover() fix (wd_mmu_write_begin/end) is working\n");
-		lldbg("DEFECT_RECOVER: PASS — no Data Abort in wd_recover() code path\n");
+		lldbg("DEFECT_RECOVER: wd_cancel()/wd_delete() use the same begin()/end() pair as wd_recover()\n");
 
-		ret = OK;
+		/* What is actually asserted: the two calls above run through
+		 * the same protection pair wd_recover() uses, so a missing
+		 * window would have faulted here, and it would also have left
+		 * the window open or a status refused.  "No crash" alone was
+		 * not a verdict - this is.
+		 */
+
+		wd_mmu_get_window_state(&win_open, &win_cpu, &win_depth);
+
+		if (!win_open && win_depth == 0 &&
+		    wd_mmu_get_failures() == fails_before) {
+			lldbg("DEFECT_RECOVER: PASS - window closed, no error counted\n");
+			ret = OK;
+		} else {
+			lldbg("DEFECT_RECOVER: FAIL - window=%s depth=%u failures=%u (was %u)\n",
+			      win_open ? "OPEN" : "closed", (unsigned int)win_depth,
+			      wd_mmu_get_failures(), fails_before);
+			ret = -EIO;
+		}
+
 		break;
 	}
 
 	case TESTIOC_WDOG_DEFECT_ABORT_HANDLER: {
 		/* Defect #12: Data Abort handler guard.
 		 *
-		 * If the Data Abort handler itself accesses the wdog pool
-		 * (e.g., for diagnostic logging), a nested Data Abort occurs.
-		 * Without a guard, this causes an infinite abort loop → hang.
+		 * The data abort report reads the live descriptor of the
+		 * address the abort was taken at (DFAR) and the state of the
+		 * watchdog write window.  If either of those reads faulted, the
+		 * handler would fault inside the handler: nested abort, no
+		 * report, hang.  What makes that impossible is checkable
+		 * without taking a fault, and is what this case asserts:
 		 *
-		 * This test triggers a Data Abort and then checks if the
-		 * handler can safely access wdog pool addresses.
+		 *   1 the watchdog page has a descriptor and is never
+		 *     No-Access - the mechanism only flips AP2, between AP=1
+		 *     (privileged read/write) and AP=3 (privileged read-only),
+		 *     so a kernel read of the page always succeeds;
+		 *   2 a read of that page from foreign code (this driver, with
+		 *     no window open) actually returns;
+		 *   3 the accessors print_mmu_fault_report() calls answer, and
+		 *     the protection is demonstrably installed;
+		 *   4 the descriptor lookup the report runs on DFAR classifies
+		 *     addresses it does not own instead of dereferencing them.
+		 *
+		 * The fatal half stays with 'wdog_write', 'region_report' and
+		 * 'heap_protect 4': those do take the abort and do print the
+		 * report from inside the handler.
 		 */
 		lldbg("=== DEFECT #12: Data Abort handler guard ===\n");
-		lldbg("DEFECT_ABORT: This test verifies abort handler safety\n");
-		lldbg("DEFECT_ABORT: The abort handler must NOT dereference wdog pool\n");
-		lldbg("DEFECT_ABORT: addresses — use DFAR register value instead.\n");
-		lldbg("DEFECT_ABORT: If handler accesses wdog pool → nested abort → hang\n");
-		lldbg("DEFECT_ABORT: Fix: Add abort-in-progress flag to abort handler\n");
 
-		/* This is a documentation-only test — no actual crash.
-		 * The real test is: trigger a wdog Data Abort and verify
-		 * the handler doesn't cause a nested abort.
-		 */
-		lldbg("DEFECT_ABORT: Test passed (documentation only — no crash)\n");
+#if defined(CONFIG_WDOG_MMU_PROTECT) && defined(CONFIG_MMU_PAGE_PROTECT)
+		{
+			uint32_t page = ((uint32_t)(uintptr_t)&g_wdog_data) & ~4095u;
+			uint32_t pte = 0;
+			uint8_t ap = 0;
+			bool open = false;
+			uint8_t cpu = 0xff;
+			uint8_t depth = 0;
+			int status = mmu_get_page_pte_raw(page, &pte, &ap);
+
+			if (status != OK) {
+				lldbg("DEFECT_ABORT: FAIL - watchdog page 0x%08x has no descriptor (%d)\n",
+				      page, status);
+				ret = -EIO;
+				break;
+			}
+
+			if (ap == 0) {
+				lldbg("DEFECT_ABORT: FAIL - page is No-Access: a handler read would fault\n");
+				ret = -EIO;
+				break;
+			}
+
+			lldbg("DEFECT_ABORT: wdog page 0x%08x pte=0x%08x AP=%u - never No-Access, a handler read is legal\n",
+			      page, pte, (unsigned int)ap);
+
+			/* Read the page only now: the descriptor above proves
+			 * the access cannot fault.  Reading it in a declaration
+			 * initialiser would abort here instead of reporting. */
+			lldbg("DEFECT_ABORT: read from outside wdog code: pool[0]=0x%02x\n",
+			      (unsigned int)(*(volatile uint8_t *)&g_wdog_data));
+
+			wd_mmu_get_window_state(&open, &cpu, &depth);
+			lldbg("DEFECT_ABORT: window=%s cpu%u depth=%u failures=%u flips=%u\n",
+			      open ? "OPEN" : "closed", (unsigned int)cpu,
+			      (unsigned int)depth, wd_mmu_get_failures(),
+			      wd_mmu_get_flips());
+
+			if (wd_mmu_get_flips() == 0) {
+				lldbg("DEFECT_ABORT: FAIL - no descriptor flip since boot, nothing is installed\n");
+				ret = -EIO;
+				break;
+			}
+		}
+#else
+		/* Half the assertions are compiled out with the protection off
+		 * (wd_mmu_is_protected()/wd_mmu_get_flips() are the stubs in
+		 * wdog.h, and mmu_get_page_pte_raw() is not even declared), so
+		 * no verdict may be claimed here. */
+		lldbg("DEFECT_ABORT: SKIP - needs CONFIG_WDOG_MMU_PROTECT and CONFIG_MMU_PAGE_PROTECT\n");
+		ret = -ENOSYS;
+		break;
+#endif
+
+		{
+			/* 0x00000000 is unclaimed, 0x60200000 is the 1MB section
+			 * 'wdog_refuse' uses, 0xf0000000 is not mapped at all.
+			 * Either answer is acceptable - what is not is a
+			 * different error, and above all the lookup has to
+			 * return: a dereference here is the nested abort this
+			 * case exists to exclude.  A section an earlier command
+			 * has already split answers "page descriptor", which is
+			 * why the refusal count is printed and not asserted.
+			 */
+			static const uint32_t hostile[] =
+			{
+				0x00000000, 0x60200000, 0xf0000000
+			};
+
+			int unexpected = 0;
+			int refused = 0;
+			int i;
+
+			for (i = 0; i < 3; i++) {
+				uint32_t pte;
+				uint8_t ap;
+				int status = mmu_get_page_pte_raw(hostile[i], &pte, &ap);
+
+				lldbg("DEFECT_ABORT: DFAR lookup 0x%08x -> %s (%d)\n",
+				      hostile[i],
+				      status == OK ? "page descriptor" : "refused",
+				      status);
+
+				if (status == OK) {
+					continue;
+				}
+
+				refused++;
+				if (status != -EINVAL) {
+					unexpected++;
+				}
+			}
+
+			if (unexpected != 0) {
+				lldbg("DEFECT_ABORT: FAIL - %d lookups returned an unexpected error\n",
+				      unexpected);
+				ret = -EIO;
+				break;
+			}
+
+			lldbg("DEFECT_ABORT: %d of 3 foreign DFARs classified without a walk\n",
+			      refused);
+		}
+
+		lldbg("DEFECT_ABORT: PASS - handler inputs are fault-free, hazard excluded by the AP policy\n");
+		lldbg("DEFECT_ABORT: fatal half still covered by wdog_write, region_report, heap_protect 4\n");
 
 		ret = OK;
 		break;
@@ -1990,58 +2816,126 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 		 *
 		 * This test checks the boot sequence for unprotected wdog writes.
 		 */
+		bool win_open = false;
+		uint8_t win_cpu = 0xff;
+		uint8_t win_depth = 0;
+		uint32_t fails = wd_mmu_get_failures();
+
 		lldbg("=== DEFECT #13: Boot order issue ===\n");
 		lldbg("DEFECT_BOOT: Checking boot sequence for unprotected wdog writes...\n");
 		lldbg("DEFECT_BOOT: wd_mmu_protect_init() is called at end of wd_initialize()\n");
 		lldbg("DEFECT_BOOT: Any wdog write between init and first wd_start() → Data Abort\n");
 		lldbg("DEFECT_BOOT: Fix: Verify no wdog writes in boot path after init\n");
 
-		/* If we reached here, boot completed without Data Abort.
-		 * This means either:
-		 * - No wdog writes occurred during boot (good)
-		 * - Protection was not enabled during boot
+		/* If we reached here, boot completed without Data Abort: an
+		 * unprotected wdog write during boot would have faulted the
+		 * box before this point.  What is left to assert is that the
+		 * protection is really live, that it has counted no error
+		 * since boot, and that no window is stuck open - the old
+		 * version printed "If protection is enabled, boot order is
+		 * safe" and returned OK whether protection existed or not.
 		 */
-		lldbg("DEFECT_BOOT: Boot completed — no Data Abort during boot sequence\n");
-		lldbg("DEFECT_BOOT: If protection is enabled, boot order is safe\n");
 
-		ret = OK;
+		lldbg("DEFECT_BOOT: Boot completed — no Data Abort during boot sequence\n");
+
+		wd_mmu_get_window_state(&win_open, &win_cpu, &win_depth);
+
+		if (wd_mmu_is_protected() && !win_open && win_depth == 0) {
+			lldbg("DEFECT_BOOT: PASS - protection live, no window stuck; "
+			      "%u error(s) counted since boot%s\n", fails,
+			      fails == 0 ? "" :
+			      " (earlier test commands count against this boot)");
+			ret = OK;
+		} else {
+			lldbg("DEFECT_BOOT: FAIL - protected=%d window=%s depth=%u failures=%u\n",
+			      wd_mmu_is_protected() ? 1 : 0,
+			      win_open ? "OPEN" : "closed",
+			      (unsigned int)win_depth, fails);
+			ret = -EIO;
+		}
+
 		break;
 	}
 
 	case TESTIOC_WDOG_DEFECT_SECTION_SIZE: {
-		/* Defect #15: L1 entry cache coherency.
+		/* Defect #15: is the protection really in the page table, and
+		 * really only one page wide?
 		 *
-		 * After wd_mmu_protect_init() modifies the L1 section entry
-		 * in the page table, the TLB may still have a cached copy
-		 * of the old entry. Without a full TLB flush, the stale
-		 * entry may allow writes → protection not effective.
+		 * The old mechanism changed a 1MB section, so "protected" and
+		 * "sixteen megabytes of neighbours protected too" were the same
+		 * operation, and a stale TLB entry of that section silently
+		 * allowed writes after the change.
 		 *
-		 * This test:
-		 * 1. Attempts a wild write to wdog pool immediately after init
-		 * 2. If TLB has stale entry → write succeeds (defect!)
-		 * 3. If TLB was flushed → Data Abort (protection works)
+		 * This test checks the descriptor of the watchdog page itself:
+		 *   - the page is mapped through the second level (a 4KB
+		 *     descriptor exists for it);
+		 *   - that descriptor says read-only;
+		 *   - the pages on either side of it are still writable, which
+		 *     is what 4KB granularity is supposed to mean.
+		 *
+		 * FATAL part (kept from the original test): the write at the
+		 * end.  With the protection in place it takes the box down,
+		 * which is the point - a write from outside the watchdog code
+		 * must not be silently allowed.
 		 */
 		volatile uint8_t *wdog_page = (volatile uint8_t *)&g_wdpool;
+		uint32_t page = ((uint32_t)(uintptr_t)wdog_page) & ~4095u;
+		uint32_t pte;
+		uint8_t ap;
+		int status;
 
-		lldbg("=== DEFECT #15: L1 entry cache coherency ===\n");
-		lldbg("DEFECT_SECTION: Attempting wild write to wdog pool...\n");
-		lldbg("DEFECT_SECTION: If TLB has stale entry → write succeeds (defect!)\n");
-		lldbg("DEFECT_SECTION: If TLB was flushed → Data Abort (protection works)\n");
+		lldbg("=== DEFECT #15: descriptor of the protected page ===\n");
 
-		/* Attempt a wild write — should Data Abort if protection works.
-		 * If it succeeds, the TLB still has a stale entry.
-		 */
+		status = mmu_get_page_pte_raw(page, &pte, &ap);
+
+		if (status != OK) {
+			lldbg("DEFECT_SECTION: FAIL - watchdog page is not 4KB-mapped\n");
+			ret = ERROR;
+			break;
+		}
+
+		lldbg("DEFECT_SECTION: wdog page 0x%08x pte=0x%08x AP=%u (%s)\n",
+		      page, pte, (unsigned int)ap,
+		      ap == 0 ? "NO ACCESS" :
+		      (ap & 2) ? "READ-ONLY" : "READ-WRITE");
+
+		if (!(ap & 2)) {
+			lldbg("DEFECT_SECTION: FAIL - watchdog page is writable\n");
+			ret = ERROR;
+			break;
+		}
+
+		/* Granularity: the neighbours must not have been dragged along.
+		 * Both sides are ordinary .bss / .data and have to stay
+		 * writable. */
+
+		if (mmu_get_page_pte_raw(page - 4096, &pte, &ap) == OK) {
+			lldbg("DEFECT_SECTION: page before:  AP=%u (%s)\n",
+			      (unsigned int)ap, (ap & 2) ? "READ-ONLY" : "writable");
+		} else {
+			lldbg("DEFECT_SECTION: page before:  not 4KB-mapped\n");
+		}
+
+		if (mmu_get_page_pte_raw(page + 4096, &pte, &ap) == OK) {
+			lldbg("DEFECT_SECTION: page after:   AP=%u (%s)\n",
+			      (unsigned int)ap, (ap & 2) ? "READ-ONLY" : "writable");
+		} else {
+			lldbg("DEFECT_SECTION: page after:   not 4KB-mapped\n");
+		}
+
+		lldbg("DEFECT_SECTION: next write is the fatal one (by design)\n");
+
 		{
 			irqstate_t irq_state = enter_critical_section();
 			uint8_t orig = wdog_page[0];
+
 			wdog_page[0] = 0xDD;
 			wdog_page[0] = orig;
 			leave_critical_section(irq_state);
 
 			lldbg("DEFECT_SECTION: === DEFECT CONFIRMED ===\n");
-			lldbg("DEFECT_SECTION: Write succeeded — TLB had stale entry!\n");
-			lldbg("DEFECT_SECTION: Protection was NOT effective immediately after init\n");
-			lldbg("DEFECT_SECTION: Fix: Use full TLB flush after L1 entry modification\n");
+			lldbg("DEFECT_SECTION: Write succeeded - stale TLB entry!\n");
+			lldbg("DEFECT_SECTION: Protection was NOT effective\n");
 		}
 
 		ret = OK;
@@ -2404,40 +3298,102 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 	case TESTIOC_WDOG_SCENARIO_NESTING_STRESS: {
 		/* TC-13: Nesting counter stress test (1000 reentrant calls).
 		 *
-		 * Call wd_mmu_write_begin() 1000 times reentrantly, then
-		 * wd_mmu_write_end() 1000 times. The nesting counter must
-		 * correctly track the depth and only restore RO protection
-		 * on the final end() call.
+		 * Only the first begin() may touch the descriptor and only the
+		 * last end() may put it back; everything in between has to be
+		 * bookkeeping.  What is checked here is the observable state -
+		 * the window, and the permission the page really has - not the
+		 * counter itself:
 		 *
-		 * If the counter overflows or underflows, the page will be
-		 * left in RW (unprotected) or RO (causing Data Abort in wdog
-		 * code).
+		 *   after 1000 begin():  window open,  page writable;
+		 *   after  999 end():    still open,   still writable;
+		 *   after the last end(): closed,       page read-only again.
+		 *
+		 * The reported depth is one byte, so 1000 levels are reported
+		 * as the 255 it saturates at; that is a reporting limit, not a
+		 * limit of the counter (which is an int).
 		 */
+		volatile uint8_t *wdog_page = (volatile uint8_t *)&g_wdpool;
+		bool win_open = false;
+		bool bad = false;			/* any observable that was wrong */
+		uint8_t win_cpu = 0xff;
+		uint8_t win_depth = 0;
+		uint32_t pte = 0;
+		uint8_t ap = 0xff;
+		uint32_t fails_before = wd_mmu_get_failures();
+		irqstate_t irq_state;
 		int i;
 
 		lldbg("=== TC-13: Nesting counter stress (1000 reentrant calls) ===\n");
 
-		/* 1000 reentrant begin() calls — nesting counter goes to 1000 */
+		irq_state = enter_critical_section();
+
 		for (i = 0; i < 1000; i++) {
-			wd_mmu_write_begin();
+			if (wd_mmu_write_begin() != OK) {
+				break;
+			}
 		}
 
-		lldbg("TC13: 1000 begin() calls done, nesting counter = 1000\n");
+		wd_mmu_get_window_state(&win_open, &win_cpu, &win_depth);
+		(void)mmu_get_page_pte_raw((uint32_t)(uintptr_t)wdog_page, &pte, &ap);
+		lldbg("TC13: after 1000 begin(): window=%s depth%u(reported, saturates at 255) AP=%u\n",
+		      win_open ? "OPEN" : "closed (FAIL)",
+		      (unsigned int)win_depth, (unsigned int)ap);
 
-		/* 999 end() calls — counter goes to 1, page still RW */
+		if (!win_open || (ap & 2)) {
+			lldbg("TC13: FAIL - page is not writable with the window open\n");
+			bad = true;
+		}
+
 		for (i = 0; i < 999; i++) {
-			wd_mmu_write_end();
+			MMU_TRYQ(wd_mmu_write_end());
 		}
 
-		lldbg("TC13: 999 end() calls done, nesting counter = 1 (page still RW)\n");
+		wd_mmu_get_window_state(&win_open, &win_cpu, &win_depth);
+		(void)mmu_get_page_pte_raw((uint32_t)(uintptr_t)wdog_page, &pte, &ap);
 
-		/* Final end() — counter goes to 0, page restored to RO */
-		wd_mmu_write_end();
+		/* AP folded to 2 bits: bit 1 set means AP2 is on, i.e. read-only.
+		 * Expected state on this line: 999 end() out of 1000 begin()
+		 * leaves the window open at depth 1, so the page MUST still be
+		 * writable; "closed" is the only wrong answer.  The verdict is
+		 * taken after the last end() below. */
 
-		lldbg("TC13: Final end() done, nesting counter = 0 (page restored to RO)\n");
-		lldbg("TC13: PASS — nesting counter handled 1000 reentrant calls\n");
+		lldbg("TC13: after 999 end():   window=%s cpu%u AP=%u (page writable=%s, expected yes)\n",
+		      win_open ? "OPEN" : "closed (FAIL)", (unsigned int)win_cpu,
+		      (unsigned int)ap, (ap & 2) ? "no (FAIL)" : "YES");
 
-		ret = OK;
+		if (!win_open || (ap & 2)) {
+			lldbg("TC13: FAIL - depth 1 must leave the window open and writable\n");
+			bad = true;
+		}
+
+		MMU_TRY(wd_mmu_write_end());
+
+		leave_critical_section(irq_state);
+
+		wd_mmu_get_window_state(&win_open, &win_cpu, &win_depth);
+		(void)mmu_get_page_pte_raw((uint32_t)(uintptr_t)wdog_page, &pte, &ap);
+
+		/* 2000 brackets that only move a counter may not have been
+		 * refused once: the counter is the system-wide one, so a
+		 * refusal here means a core stepped into a window it does not
+		 * own (or closed a window that was already closed). */
+
+		if (wd_mmu_get_failures() != fails_before) {
+			lldbg("TC13: FAIL - %u refused/failed flips during the loop\n",
+			      (unsigned int)(wd_mmu_get_failures() - fails_before));
+			bad = true;
+		}
+
+		if (!win_open && (ap & 2) && !bad) {
+			lldbg("TC13: PASS - closed after the last end(), page read-only, no refusal\n");
+			ret = OK;
+		} else {
+			lldbg("TC13: FAIL - window=%s AP=%u bad=%s after the last end()\n",
+			      win_open ? "still OPEN" : "closed", (unsigned int)ap,
+			      bad ? "yes" : "no");
+			ret = -EIO;
+		}
+
 		break;
 	}
 
@@ -2503,6 +3459,157 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 
 #endif /* CONFIG_WDOG_MMU_SCENARIO_TEST */
 
+#ifdef CONFIG_WDOG_MMU_PROTECT
+	/* TESTIOC_WDOG_MMU_WINDOW_STATE (58): the write window as it stands.
+	 * Read-only - it never opens a window, so it can be run before,
+	 * between and after any other case. */
+
+	case TESTIOC_WDOG_MMU_WINDOW_STATE:
+		{
+			bool win_open = false;
+			uint8_t win_cpu = 0xff;
+			uint8_t win_depth = 0;
+
+			wd_mmu_get_window_state(&win_open, &win_cpu, &win_depth);
+			lldbg("WD_WINDOW: protected=%d window=%s owner=cpu%u depth=%u\n",
+			      wd_mmu_is_protected() ? 1 : 0,
+			      win_open ? "OPEN" : "closed",
+			      (unsigned int)win_cpu, (unsigned int)win_depth);
+			lldbg("WD_WINDOW: wdog failures=%u, descriptor flips=%u, "
+			      "discarded statuses=%d\n",
+			      wd_mmu_get_failures(), wd_mmu_get_flips(),
+			      g_mmu_op_failures);
+			ret = OK;
+			break;
+		}
+
+	/* TESTIOC_WDOG_MMU_PAGE_REPORT (59): the live descriptor of the page
+	 * that holds g_wdog_data.  A non-OK status means the page is no longer
+	 * 4KB-mapped, which is what would happen if some other path rebuilt its
+	 * L1 entry as a section.  AP2 (bit 9) is the bit wd_mmu_install()
+	 * flips, so on its own it decides read-only versus writable. */
+
+	case TESTIOC_WDOG_MMU_PAGE_REPORT:
+		{
+			uint32_t page = (uint32_t)((uintptr_t)&g_wdog_data & ~(uintptr_t)0xfff);
+			uint32_t pte = 0;
+			uint8_t ap = 0xff;
+			int status = mmu_get_page_pte_raw(page, &pte, &ap);
+
+			lldbg("WD_PAGE: 0x%08x status=%d pte=0x%08x AP=%u %s\n",
+			      page, status, pte, (unsigned int)ap,
+			      status != OK ? "NOT 4KB-MAPPED - protection is gone" :
+			      ((pte & (1 << 9)) ? "read-only" : "WRITABLE"));
+			lldbg("WD_PAGE: wdog failures=%u, discarded statuses=%d\n",
+			      wd_mmu_get_failures(), g_mmu_op_failures);
+			ret = status;
+			break;
+		}
+
+	/* TESTIOC_WDOG_MMU_REFUSE_SECTION (60): a 1MB-mapped address must be
+	 * refused, never split behind the owner's back.  The candidate is
+	 * picked with mmu_get_page_pte_raw() first, so only an address that is
+	 * a section and is not already page-mapped reaches
+	 * mmu_set_page_no_access(), and that call only takes its refusal path
+	 * without writing anything. */
+
+	case TESTIOC_WDOG_MMU_REFUSE_SECTION:
+		{
+			FAR uint32_t *l1 = mmu_get_os_l1_pgtbl();
+			uint32_t sect = (uint32_t)((uintptr_t)&g_wdog_data) & 0xfff00000;
+			uint32_t probe;
+			uint32_t pte = 0;
+			uint8_t ap = 0xff;
+			int status = -ENOENT;
+
+			for (probe = sect + (1 << 20);
+			     probe < sect + (8 << 20);
+			     probe += (1 << 20)) {
+				if ((l1[probe >> 20] & PMD_TYPE_MASK) != PMD_TYPE_SECT) {
+					continue;
+				}
+
+				if (mmu_get_page_pte_raw(probe, &pte, &ap) == OK) {
+					continue;  /* already page-mapped: not a candidate */
+				}
+
+				status = mmu_set_page_no_access(probe);
+				lldbg("WD_REFUSE: 0x%08x is still a section, set_no_access -> %d (%s)\n",
+				      probe, status,
+				      status == -EINVAL ? "refused as expected" : "UNEXPECTED");
+				break;
+			}
+
+			if (status == -ENOENT) {
+				lldbg("WD_REFUSE: no section-mapped address near 0x%08x\n", sect);
+			}
+
+			ret = (status == -EINVAL) ? OK : status;
+			break;
+		}
+
+	/* TESTIOC_WDOG_MMU_WINDOW_PAIR (61): arg begin()/end() pairs, then a
+	 * nested pair, then one close too many.  Nothing here may leave the
+	 * page writable or a status behind unused: the counters and the window
+	 * state decide the verdict, not the absence of a crash. */
+
+	case TESTIOC_WDOG_MMU_WINDOW_PAIR:
+		{
+			unsigned int reps = (arg >= 1 && arg <= 1000) ? (unsigned int)arg : 32;
+			unsigned int i;
+			uint32_t before = wd_mmu_get_failures();
+			uint32_t after;
+			int ops_before = g_mmu_op_failures;
+			bool win_open = false;
+			uint8_t win_cpu = 0xff;
+			uint8_t win_depth = 0;
+			int extra;
+
+			for (i = 0; i < reps; i++) {
+				MMU_TRY(wd_mmu_write_begin());
+				MMU_TRY(wd_mmu_write_end());
+			}
+
+			MMU_TRY(wd_mmu_write_begin());
+			MMU_TRY(wd_mmu_write_begin());
+			wd_mmu_get_window_state(&win_open, &win_cpu, &win_depth);
+			lldbg("WD_PAIR: nested depth=%u owner=cpu%u (expect 2, this cpu)\n",
+			      (unsigned int)win_depth, (unsigned int)win_cpu);
+			MMU_TRY(wd_mmu_write_end());
+			MMU_TRY(wd_mmu_write_end());
+
+			/* One close with no open: must be refused, must not
+			 * touch the descriptor and must not say OK. */
+
+			extra = wd_mmu_write_end();
+			wd_mmu_get_window_state(&win_open, &win_cpu, &win_depth);
+			lldbg("WD_PAIR: %u pairs, unpaired close -> %d, window=%s depth=%u\n",
+			      reps, extra, win_open ? "OPEN" : "closed",
+			      (unsigned int)win_depth);
+
+			after = wd_mmu_get_failures();
+			lldbg("WD_PAIR: failures %u -> %u (expect exactly %u + 1), discarded statuses=%d\n",
+			      before, after, before, g_mmu_op_failures);
+
+			/* The unpaired end() above is a deliberate negative
+			 * test: it has to be refused and it has to be counted
+			 * exactly once, so the failure counter is expected to
+			 * grow by one - not to stay where it started, and not
+			 * by anything else either.  Every other condition here
+			 * means the paired work itself was not clean.
+			 */
+
+			ret = OK;
+			if (after != before + 1 ||
+			    g_mmu_op_failures != ops_before ||
+			    win_open || win_depth != 0 || extra == OK) {
+				ret = -EIO;
+			}
+
+			break;
+		}
+#endif /* CONFIG_WDOG_MMU_PROTECT */
+
 	default:
 		vdbg("Unrecognized cmd: %d arg: %ld\n", cmd, arg);
 		break;
@@ -2518,6 +3625,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long 
 
 	return ret;
 }
+
 static ssize_t os_api_test_drv_read(FAR struct file *filep, FAR char *buffer, size_t len)
 {
 	return 0;                                       /* Return EOF */

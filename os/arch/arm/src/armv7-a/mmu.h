@@ -1683,7 +1683,17 @@ uint32_t mmu_save_page_pte(uint32_t vaddr);
  ****************************************************************************/
 
 #ifndef CONFIG_ARCH_ROMPGTABLE
-void mmu_split_section_to_l2(uint32_t vaddr);
+int mmu_split_section_to_l2(uint32_t vaddr);
+
+/* Claim the L2 table covering a region that stays protected forever. */
+int mmu_protect_page_reserve(uint32_t vaddr, const char *owner);
+
+/* Read back the live descriptor of a 4KB page: the full entry, and its
+ * access permission folded to AP[1:0] | (AP2 << 1) - 0 = no access,
+ * 1 = privileged read/write, 3 = privileged read-only (so "is it
+ * protected?" is a test of bit 1).  Used by the fault report and by the
+ * protection tests.  -EINVAL if not 4KB-mapped. */
+int mmu_get_page_pte_raw(uint32_t vaddr, uint32_t *pte, uint8_t *ap);
 #endif
 
 /****************************************************************************
@@ -1700,7 +1710,7 @@ void mmu_split_section_to_l2(uint32_t vaddr);
  ****************************************************************************/
 
 #ifdef CONFIG_MMU_PAGE_PROTECT
-void mmu_set_page_no_access(uint32_t vaddr);
+int mmu_set_page_no_access(uint32_t vaddr);
 #endif
 
 /****************************************************************************
@@ -1717,7 +1727,7 @@ void mmu_set_page_no_access(uint32_t vaddr);
  ****************************************************************************/
 
 #ifdef CONFIG_MMU_PAGE_PROTECT
-void mmu_set_page_ro(uint32_t vaddr);
+int mmu_set_page_ro(uint32_t vaddr);
 #endif
 
 /****************************************************************************
@@ -1734,12 +1744,13 @@ void mmu_set_page_ro(uint32_t vaddr);
  ****************************************************************************/
 
 #ifdef CONFIG_MMU_PAGE_PROTECT
-void mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte);
+int mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte);
 
 /* R4: protect/unprotect every full 4KB page inside [vaddr, vaddr+len).
  * Ragged edges untouched; headers never locked.  Sections are split to
  * L2 first (bounded by the static L2 pool - on exhaustion the range is
- * skipped, never corrupted).  Returns number of pages affected. */
+ * skipped, never corrupted).  Returns number of pages affected, or
+ * -ENOMEM if the L2 pool was exhausted before any page could be locked. */
 int mmu_protect_range_no_access(uintptr_t vaddr, size_t len);
 int mmu_restore_range(uintptr_t vaddr, size_t len);
 void mmu_set_uaf_protect_enabled(int on);

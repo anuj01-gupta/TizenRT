@@ -85,6 +85,17 @@ void mm_addfreechunk(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node)
 	FAR struct mm_freenode_s *prev;
 
 #ifdef CONFIG_DEBUG_MM_UAF
+#ifdef CONFIG_MM_HEAP_UAF_PROTECT
+	/* Plan finding 1 / Q9: the two detectors coexist.  A node can reach
+	 * here already locked - mm_free() locks it at its allocated size
+	 * before coalescing - so writing the poison pattern into it would
+	 * touch an AP=0 page.  Unlock first and let MM_UAF_PROTECT_ON_FREE()
+	 * at the foot of this function relock it.  Both are no-ops while the
+	 * gate is closed or the chunk is under the 4KB floor, which is
+	 * exactly the population the poison pattern covers: the detectors
+	 * partition by size rather than excluding each other. */
+	MM_UAF_PROTECT_BEFORE_USE(node);
+#endif
 	mm_uaf_poison(node);
 #endif
 

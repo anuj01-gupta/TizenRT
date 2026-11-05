@@ -22,10 +22,24 @@
 #include <tinyara/config.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <sys/types.h>
 #include <tinyara/sched.h>
 #include <tinyara/mm/mm.h>
 #include <tinyara/security_level.h>
+
+/* mm_heap is compiled twice: into the kernel, and into libumm for the loadable
+ * binaries.  Only the kernel copy is linked against the armv7-a MMU code, and
+ * the user heap is never MMU-protected (same split as the R4 hooks in
+ * tinyara/mm/mm.h).  Where the arch call is not linkable, nothing can carry an
+ * AP=0 descriptor, so compile the check out instead of emitting a reference
+ * nothing can resolve. */
+#if defined(CONFIG_MMU_PAGE_PROTECT) && \
+	(defined(CONFIG_BUILD_FLAT) || defined(__KERNEL__))
+#include <tinyara/mmu.h>
+#else
+#define mmu_range_is_no_access(a) (false)
+#endif
 
 /************************************************************************
  * Name: heap_dbg
@@ -68,10 +82,24 @@ void mm_dump_heap_region(uint32_t start, uint32_t end)
 	heap_dbg("#########################################################################################\n");
 	heap_dbg("Dump heap: 0x%08x - 0x%08x\n", start, end);
 	heap_dbg("#########################################################################################\n");
-	for (; start < end; start += 32) {
+	while (start < end) {
 		uint32_t *ptr = (uint32_t *)start;
+
+		/* Plan risk R5: the data area of a freed chunk can be
+		 * No-Access (TC-R4 locks it through the MMU).  Reading it
+		 * here would raise a second Data Abort inside the reporter
+		 * whose only job is to explain the first one, so ask the
+		 * page table and say what was not read. */
+		if (mmu_range_is_no_access(start)) {
+			heap_dbg("%08x: <no-access: protected, contents not read>\n",
+				 start);
+			start = (start & ~0xfffU) + 0x1000;
+			continue;
+		}
+
 		heap_dbg("%08x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
 			   start, ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7]);
+		start += 32;
 	}
 	heap_dbg("#########################################################################################\n");
 }

@@ -156,7 +156,17 @@ int wd_delete(WDOG_ID wdog)
 		 * timers, all with interrupts disabled.
 		 */
 
-		wd_mmu_write_begin();	/* Allow writes to wdog protected page */
+		/* L2 descriptor for the watchdog page -> RW.  Without the window
+		 * the timer cannot be put back on the free list: keeping it out
+		 * of the list is the lesser harm compared to faulting on the
+		 * write, and the caller is told.
+		 */
+
+		if (wd_mmu_write_begin() != OK) {
+			leave_critical_section(state);
+			return -EIO;
+		}
+
 		sq_addlast((FAR sq_entry_t *)wdog, &g_wdfreelist);
 		g_wdnfree++;
 		DEBUGASSERT(g_wdnfree <= CONFIG_PREALLOC_WDOGS);

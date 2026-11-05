@@ -129,7 +129,16 @@ WDOG_ID wd_create(void)
 		 * count of free timers all with interrupts disabled.
 		 */
 
-		wd_mmu_write_begin();	/* Allow writes to wdog protected page */
+		/* L2 descriptor for the watchdog page -> RW.  Without the window
+		 * the free list cannot be updated, so this is an allocation
+		 * failure and is reported as one; writing to the page as it
+		 * stands would fault instead.
+		 */
+
+		if (wd_mmu_write_begin() != OK) {
+			leave_critical_section(state);
+			return NULL;
+		}
 
 		wdog = (FAR struct wdog_s *)sq_remfirst(&g_wdfreelist);
 

@@ -201,8 +201,8 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
 	 * After the merge below - and after the mm_addfreechunk() hook,
 	 * which is kept for split remainders and realloc - this node is a
 	 * coalesced free-run of many MB, always larger than
-	 * MM_UAF_PROTECT_MAX_SIZE, so protecting only there never locks a
-	 * single page (observed: ok=0 with 12702 frees).  Delayed frees
+	 * the arch bound (mmu_protect_range_max()), so protecting only there never
+	 * takes a single page (observed: ok=0 with 12702 frees).  Delayed frees
 	 * re-enter mm_free() through mm_free_delaylist() (mm_malloc.c:125)
 	 * and are covered by this same call.  Everything is a no-op until
 	 * the test driver arms the gate (mmu_set_uaf_protect_enabled()). */

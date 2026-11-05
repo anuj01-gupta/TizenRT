@@ -84,18 +84,57 @@ extern "C" {
 #define EXTERN extern
 #endif
 
-/* Watchdog data variables.
+/* All watchdog globals live in one object.
  *
- * g_wdpool is the pre-allocated watchdog array.  When CONFIG_WDOG_MMU_PROTECT
- * is enabled, g_wdpool is placed in a separate .wdog_pool linker section
- * (1MB-aligned, in its own L1 section) so it can be individually protected
- * via L1 section AP bit manipulation — no L2 split needed.
+ * With CONFIG_WDOG_MMU_PROTECT this object is 4KB-aligned, occupies exactly
+ * one page and is placed in the .wdog_data section, so a single second-level
+ * page-table descriptor covers the pool, both list heads and the free
+ * counter.  Protecting the watchdog data then costs one descriptor write, and
+ * because the object fills its page no other data shares the permissions
+ * being flipped.
  */
 
-extern sq_queue_t g_wdfreelist;
-extern sq_queue_t g_wdactivelist;
-extern uint16_t g_wdnfree;
-extern struct wdog_s g_wdpool[];
+struct wdog_data_core_s {
+	sq_queue_t freelist;			/* Head of the free wdog list */
+	sq_queue_t activelist;			/* Head of the active wdog list */
+	uint16_t nfree;			/* Number of wdogs on the free list */
+	uint8_t pad0[2];
+	struct wdog_s pool[CONFIG_PREALLOC_WDOGS];
+};
+
+/* The design rests on the data fitting in one page.  Check it at compile
+ * time (a negative array size) so a wrong CONFIG_PREALLOC_WDOGS fails the
+ * build instead of quietly making a neighbour page read-only; the linker
+ * ASSERT and wd_mmu_protect_init() repeat the check. */
+
+/* Upper bound on the queue this design supports, checked against the page
+ * size at compile time: 96 slots is a generous worst case, and any value
+ * above it would push the consolidated object past one page and make a
+ * neighbour read-only.  The linker ASSERT and wd_mmu_protect_init() repeat
+ * the check at link and at boot. */
+
+#define WDOG_POOL_MAX  96
+
+typedef char wdog_data_fits_one_page[(sizeof(struct wdog_data_core_s) <= 4096) ? 1 : -1];
+
+#if CONFIG_PREALLOC_WDOGS > WDOG_POOL_MAX
+#  error "CONFIG_PREALLOC_WDOGS exceeds WDOG_POOL_MAX: watchdog data would not fit one 4KB page"
+#endif
+
+struct wdog_data_s {
+	struct wdog_data_core_s core;
+	uint8_t pad_page[4096 - sizeof(struct wdog_data_core_s)];
+};
+
+extern struct wdog_data_s g_wdog_data;
+
+/* The names the subsystem uses.  The globals are members of the consolidated
+ * object, so no other file needs to change. */
+
+#define g_wdfreelist			g_wdog_data.core.freelist
+#define g_wdactivelist		g_wdog_data.core.activelist
+#define g_wdnfree				g_wdog_data.core.nfree
+#define g_wdpool				g_wdog_data.core.pool
 
 
 
@@ -204,28 +243,44 @@ struct tcb_s;
 void wd_recover(FAR struct tcb_s *tcb);
 
 /****************************************************************************
- * MMU Page Protection for Watchdog Static Memory
+ * MMU Page Protection for the Watchdog Data Page
  *
- * When CONFIG_WDOG_MMU_PROTECT is enabled, the wdog pool's 1MB L1 section
- * is kept Read-Only by setting AP bits (AP2=1, AP[1:0]=11) on the L1
- * section entry.  Wdog code must call wd_mmu_write_begin() before
- * modifying any wdog data, and wd_mmu_write_end() afterwards.
+ * When CONFIG_WDOG_MMU_PROTECT is enabled, the second-level descriptor of
+ * the page that holds g_wdog_data is kept Read-Only.  Wdog code must call
+ * wd_mmu_write_begin() before modifying any wdog data, and
+ * wd_mmu_write_end() afterwards; the implementation is wd_mmu_protect.c.
  *
- * No L2 split is needed — .wdog_pool is in its own 1MB section.
+ * All of it lives in wd_mmu_protect.c - the page is mapped through the
+ * second level at boot and its table is claimed for good, so no split and
+ * no descriptor work happens on the write path.
  *
  * When disabled, these are no-ops.
  ****************************************************************************/
 
 
 #ifdef CONFIG_WDOG_MMU_PROTECT
-void wd_mmu_protect_init(void);
-void wd_mmu_write_begin(void);
-void wd_mmu_write_end(void);
+int  wd_mmu_protect_init(void);
+int  wd_mmu_write_begin(void);
+int  wd_mmu_write_end(void);
+bool wd_mmu_is_protected(void);
+void wd_mmu_get_window_state(FAR bool *open, FAR uint8_t *cpu, FAR uint8_t *depth);
+uint32_t wd_mmu_get_failures(void);
+uint32_t wd_mmu_get_flips(void);
 #else
-#define wd_mmu_protect_init()  do { } while (0)
-#define wd_mmu_write_begin()   do { } while (0)
-#define wd_mmu_write_end()     do { } while (0)
+#define wd_mmu_protect_init()                OK
+#define wd_mmu_write_begin()                 OK
+#define wd_mmu_write_end()                   OK
+#define wd_mmu_is_protected()                (false)
+#define wd_mmu_get_failures()                (0)
+#define wd_mmu_get_flips()                   (0)
+#define wd_mmu_get_window_state(a, b, c)     do { *(a) = false; *(b) = 0; *(c) = 0; } \
+                                               while (0)
 #endif
+
+/* Read-only view of the active watchdog list, for diagnostics outside the
+ * subsystem (test drivers).  Available in every configuration. */
+
+FAR struct sq_queue_s *wd_activelist(void);
 
 #undef EXTERN
 

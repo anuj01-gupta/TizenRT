@@ -122,14 +122,14 @@ void wd_recover(FAR struct tcb_s *tcb)
 
 	flags = enter_critical_section();
 	if (tcb->waitdog) {
-		/* FIX (v1.2): Protect wdog writes with MMU begin/end.
-		 * wd_cancel() and wd_delete() modify wdog pool data structures.
-		 * Without wd_mmu_write_begin(), these writes cause a Data Abort
-		 * when CONFIG_WDOG_MMU_PROTECT is enabled (fixes Defect #11). */
-		wd_mmu_write_begin();
+		/* wd_cancel() and wd_delete() bracket their own writes to the
+		 * watchdog data page.  Wrapping them in another bracket here
+		 * only made the window outlive the code that owns it, so a
+		 * fault inside this block could not be attributed to either of
+		 * them. */
+
 		(void)wd_cancel(tcb->waitdog);
 		(void)wd_delete(tcb->waitdog);
-		wd_mmu_write_end();
 		tcb->waitdog = NULL;
 	}
 

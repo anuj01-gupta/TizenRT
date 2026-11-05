@@ -262,40 +262,30 @@ config WDOG_INTRESERVE
 config WDOG_MMU_PROTECT
 	bool "Watchdog MMU page protection"
 	default n
-	depends on ARCH_USE_MMU
+	depends on MMU_PAGE_PROTECT && !ARCH_ROMPGTABLE
 	---help---
 		Enable MMU page-level protection for watchdog static memory.
-		All watchdog static data (g_wdfreelist, g_wdactivelist, g_wdnfree,
-		and g_wdpool[]) is packed into a single page-aligned 4KB page.
-		After initialization, the page is set to Read-Only.  Any wild
-		pointer write from non-wdog code triggers an immediate Data Abort
-		at the corrupting instruction.
+		All watchdog static data (the free and active list heads, the
+		free count and the watchdog pool) is packed into one object
+		that occupies a single 4KB page by itself (.wdog_data).
+
+		After initialization, the second-level page table descriptor
+		of that page is set to privileged Read-Only.  Any wild pointer
+		write from non-wdog code triggers an immediate Data Abort at
+		the corrupting instruction.
 
 		Wdog code temporarily restores Read-Write permission before
-		modifying its data, then re-protects the page.  A nesting counter
-		handles reentrant calls (e.g. wd_timer -> callback -> wd_start).
+		modifying its data, then re-protects the page.  A nesting
+		counter handles reentrant calls (e.g. wd_timer -> callback ->
+		wd_start); it is global rather than per-CPU because the
+		descriptor is shared by the cores, so one write window covers
+		both of them.  Closing it invalidates the address in the TLB
+		of every core.
 
-		This provides early detection of memory corruption affecting the
-		watchdog subsystem.
-
-		SMP support: The DACR (Domain Access Control Register) is per-CPU.
-		The read-modify-write on DACR uses an atomic ldrex/strex loop on
-		a shared shadow variable to prevent cross-core race conditions
-		that could clobber domain 0 (kernel text) and cause Prefetch Abort.
-		Enable CONFIG_WDOG_MMU_DACR_DEBUG for runtime DACR corruption alerts.
-
-config WDOG_MMU_DACR_DEBUG
-	bool "Watchdog MMU DACR debug logging"
-	default n
-	depends on WDOG_MMU_PROTECT
-	---help---
-		Enable debug logging for DACR (Domain Access Control Register)
-		modifications in the watchdog MMU protection code. When enabled,
-		an alert is printed if domain 0 (kernel text) is ever clobbered
-		to No-Access during wd_mmu_write_begin()/wd_mmu_write_end().
-
-		This helps diagnose SMP Prefetch Abort crashes caused by DACR
-		corruption.
+		This provides early detection of memory corruption affecting
+		the watchdog subsystem, at 4KB granularity: no memory other
+		than the watchdog page is affected by the permission change,
+		and no separate 1MB region has to be reserved for it.
 
 config WDOG_MMU_DEFECT_TEST
 	bool "Watchdog MMU defect reproduction tests"
@@ -309,41 +299,6 @@ config WDOG_MMU_DEFECT_TEST
 
 		All test code is compiled in only when this option is enabled.
 		When disabled, zero code is added.
-
-config WDOG_MMU_DEFECT_TEST_SMP
-	bool "Defect #1: SMP DACR per-core issue"
-	default n
-	depends on WDOG_MMU_DEFECT_TEST
-	---help---
-		Reproduce the SMP safety defect: DACR is per-CPU, so
-		wd_mmu_write_begin() on Core 0 does not update Core 1's DACR.
-		Core 1 accessing wdog pool → Data Abort.
-
-config WDOG_MMU_DEFECT_TEST_DSB
-	bool "Defect #3: Missing dsb after DACR write"
-	default n
-	depends on WDOG_MMU_DEFECT_TEST
-	---help---
-		Reproduce the missing memory barrier defect: without dsb
-		after DACR write, out-of-order cores may use stale DACR
-		value → intermittent Data Abort.
-
-config WDOG_MMU_DEFECT_TEST_DACR_CLOBBER
-	bool "Defect #7: DACR clobbers other domains"
-	default n
-	depends on WDOG_MMU_DEFECT_TEST
-	---help---
-		Reproduce the DACR clobber defect: wd_mmu_write_begin()
-		overwrites the entire DACR, clobbering domains 2-15.
-
-config WDOG_MMU_DEFECT_TEST_HEAP_OVERLAP
-	bool "Defect #8: Heap overlap with wdog pool"
-	default n
-	depends on WDOG_MMU_DEFECT_TEST
-	---help---
-		Reproduce the heap overlap defect: verify heap does not
-		cover the wdog pool region. If it does, heap allocations
-		in the wdog pool region → Data Abort on write.
 
 config WDOG_MMU_DEFECT_TEST_WD_RECOVER
 	bool "Defect #11: wd_recover() missing protection"
@@ -369,15 +324,6 @@ config WDOG_MMU_DEFECT_TEST_BOOT_ORDER
 	---help---
 		Reproduce the boot order defect: verify no wdog writes occur
 		between wd_initialize() and the first user wd_start() call.
-
-config WDOG_MMU_DEFECT_TEST_SECTION_SIZE
-	bool "Defect #15: L1 entry cache coherency"
-	default n
-	depends on WDOG_MMU_DEFECT_TEST
-	---help---
-		Reproduce the L1 cache coherency defect: after
-		wd_mmu_protect_init() modifies the L1 entry, stale TLB
-		entry may still allow writes → protection not effective.
 
 config WDOG_MMU_SCENARIO_TEST
 	bool "Watchdog MMU scenario tests"

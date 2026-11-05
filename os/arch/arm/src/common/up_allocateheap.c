@@ -142,16 +142,25 @@ void up_allocate_kheap(FAR void **heap_start, size_t *heap_size)
 	}
 
 #ifdef CONFIG_WDOG_MMU_PROTECT
-	/* Place the heap start after the .wdog_pool section (1MB-aligned).
-	 * The .wdog_pool section is set to Read-Only by wd_mmu_protect_init(),
-	 * so the heap must not cover it.  By starting the heap at __wdog_pool_end__,
-	 * we get a single contiguous heap region that never overlaps the RO section.
+	/* The watchdog data page itself lives in .bss (see the .wdog_data output
+	 * section), so it needs no gap around it and the allocator can never
+	 * hand it out.  The kernel heap still has to start above the extended
+	 * (user) heap, which begins at __psram_heap_buffer_start__ right after
+	 * .bss: starting the kernel heap there would give both allocators the
+	 * same memory.  __kheap_base__ is the partition boundary from the
+	 * linker script.
 	 */
+
 	{
-		extern uint32_t __wdog_pool_end__[];
-		uint32_t wdog_end = (uint32_t)__wdog_pool_end__;
-		if (wdog_end > (uint32_t)*heap_start && wdog_end < (uint32_t)KREGION_END) {
-			*heap_start = (void *)wdog_end;
+		/* weak: boards whose linker script has no such partition resolve
+		 * this to 0, which leaves the heap start untouched.
+		 */
+
+		extern uint32_t __kheap_base__[] __attribute__((weak));
+		uint32_t kbase = (uint32_t)__kheap_base__;
+
+		if (kbase > (uint32_t)*heap_start && kbase < (uint32_t)KREGION_END) {
+			*heap_start = (void *)kbase;
 		}
 	}
 #endif

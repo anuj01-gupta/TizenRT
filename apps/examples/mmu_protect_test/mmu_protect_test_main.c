@@ -51,6 +51,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <errno.h>
 
@@ -71,24 +72,45 @@
 #define TESTIOC_WDOG_MMU_PROTECT_TEST _TESTIOC(27)
 #endif
 
-#ifdef CONFIG_WDOG_MMU_SCENARIO_TEST
+/* Fallbacks, for a build without CONFIG_DRIVERS_OS_API_TEST.  When the driver
+ * header is present it stays the only source of these numbers, so no TESTIOC_*
+ * name is defined twice.  The defect group also follows the header's guard
+ * (CONFIG_WDOG_MMU_DEFECT_TEST, not the scenario one) and the header's current
+ * name for id 30: TESTIOC_WDOG_DEFECT_DOMAIN_KEEP.  Id 30 was sent out under
+ * the retired DACR-era name, which made "defect_dacr_clobber" quietly run the
+ * domain-keep case while printing its own label. */
+
+#if defined(CONFIG_WDOG_MMU_DEFECT_TEST) && !defined(CONFIG_DRIVERS_OS_API_TEST)
 #ifndef _TESTIOC
-#define _TESTIOC(nr)               _IOC(_TESTIOCBASE, nr)
+#define _TESTIOC(nr)                _IOC(_TESTIOCBASE, nr)
 #endif
 #ifndef OS_API_TEST_DRVPATH
-#define OS_API_TEST_DRVPATH        "/dev/os_api_test"
+#define OS_API_TEST_DRVPATH         "/dev/os_api_test"
 #endif
-#define TESTIOC_WDOG_DEFECT_SMP            _TESTIOC(28)
-#define TESTIOC_WDOG_DEFECT_DSB             _TESTIOC(29)
-#define TESTIOC_WDOG_DEFECT_DACR_CLOBBER    _TESTIOC(30)
-#define TESTIOC_WDOG_DEFECT_HEAP_OVERLAP    _TESTIOC(31)
-#define TESTIOC_WDOG_DEFECT_WD_RECOVER      _TESTIOC(32)
-#define TESTIOC_WDOG_DEFECT_ABORT_HANDLER   _TESTIOC(33)
-#define TESTIOC_WDOG_DEFECT_BOOT_ORDER      _TESTIOC(34)
-#define TESTIOC_WDOG_DEFECT_SECTION_SIZE    _TESTIOC(35)
-#endif /* CONFIG_WDOG_MMU_SCENARIO_TEST */
+#define TESTIOC_WDOG_DEFECT_SMP           _TESTIOC(28)
+#define TESTIOC_WDOG_DEFECT_DSB           _TESTIOC(29)
+#define TESTIOC_WDOG_DEFECT_DOMAIN_KEEP   _TESTIOC(30)
+#define TESTIOC_WDOG_DEFECT_HEAP_OVERLAP  _TESTIOC(31)
+#define TESTIOC_WDOG_DEFECT_WD_RECOVER    _TESTIOC(32)
+#define TESTIOC_WDOG_DEFECT_ABORT_HANDLER _TESTIOC(33)
+#define TESTIOC_WDOG_DEFECT_BOOT_ORDER    _TESTIOC(34)
+#define TESTIOC_WDOG_DEFECT_SECTION_SIZE  _TESTIOC(35)
+#endif
 
-#ifdef CONFIG_WDOG_MMU_SCENARIO_TEST
+#if defined(CONFIG_WDOG_MMU_PROTECT) && !defined(CONFIG_DRIVERS_OS_API_TEST)
+#ifndef _TESTIOC
+#define _TESTIOC(nr)                _IOC(_TESTIOCBASE, nr)
+#endif
+#ifndef OS_API_TEST_DRVPATH
+#define OS_API_TEST_DRVPATH         "/dev/os_api_test"
+#endif
+#define TESTIOC_WDOG_MMU_WINDOW_STATE     _TESTIOC(58)
+#define TESTIOC_WDOG_MMU_PAGE_REPORT      _TESTIOC(59)
+#define TESTIOC_WDOG_MMU_REFUSE_SECTION   _TESTIOC(60)
+#define TESTIOC_WDOG_MMU_WINDOW_PAIR      _TESTIOC(61)
+#endif
+
+#if defined(CONFIG_WDOG_MMU_SCENARIO_TEST) && !defined(CONFIG_DRIVERS_OS_API_TEST)
 #ifndef _TESTIOC
 #define _TESTIOC(nr)               _IOC(_TESTIOCBASE, nr)
 #endif
@@ -103,7 +125,7 @@
 #define TESTIOC_WDOG_SCENARIO_LONG_RUN        _TESTIOC(41)
 #endif /* CONFIG_WDOG_MMU_SCENARIO_TEST */
 
-#ifdef CONFIG_MMU_PAGE_PROTECT
+#if defined(CONFIG_MMU_PAGE_PROTECT) && !defined(CONFIG_DRIVERS_OS_API_TEST)
 #ifndef _TESTIOC
 #define _TESTIOC(nr)               _IOC(_TESTIOCBASE, nr)
 #endif
@@ -120,6 +142,7 @@
 #define TESTIOC_AL_SMP_RESTORE        _TESTIOC(49)
 #define TESTIOC_AL_SMP_SPLIT          _TESTIOC(50)
 #define TESTIOC_AL_R1_SPLIT_CORRECTNESS _TESTIOC(51)
+#define TESTIOC_MMU_L2_POOL_USAGE       _TESTIOC(62)
 #ifdef CONFIG_MMU_FAULT_REPORT
 #define TESTIOC_MMU_REGION_REPORT     _TESTIOC(52)
 #endif
@@ -154,15 +177,27 @@ static void mmu_protect_test_usage(void)
 	printf("  wdog_write — Write to wdog protected page from outside wdog code\n");
 	printf("               If CONFIG_WDOG_MMU_PROTECT=y → Data Abort (crash)\n");
 	printf("               If CONFIG_WDOG_MMU_PROTECT=n → write succeeds (no crash)\n");
+#ifdef CONFIG_WDOG_MMU_PROTECT
+	printf("\n");
+	printf("Watchdog write-window tests (read-only, safe any time):\n");
+	printf("  wdog_state   — window open/closed, owner CPU, nesting depth,\n");
+	printf("                 wdog failure counter + discarded-status counter\n");
+	printf("  wdog_page    — live L2 descriptor of the protected page (PTE, AP)\n");
+	printf("  wdog_refuse  — a section-mapped address must be refused (-EINVAL)\n");
+	printf("  wdog_pair N  — N begin()/end() pairs, a nested pair, one end() too\n");
+	printf("                 many.  PASS only if both failure counters stayed at\n");
+	printf("                 zero, so it asserts instead of just surviving.\n");
+#endif
 #ifdef CONFIG_WDOG_MMU_SCENARIO_TEST
 	printf("\n");
 	printf("Defect Reproduction Tests (requires CONFIG_WDOG_MMU_SCENARIO_TEST):\n");
 	printf("  defect_smp            — Defect #1: SMP DACR per-core issue\n");
 	printf("  defect_dsb            — Defect #3: Missing dsb after DACR write\n");
-	printf("  defect_dacr_clobber   — Defect #7: DACR clobbers other domains\n");
+	printf("  defect_domain_keep    — Defect #7: domain kept across a write window\n");
+	printf("                        (the old name defect_dacr_clobber still works)\n");
 	printf("  defect_heap_overlap   — Defect #8: Heap overlap with wdog pool\n");
 	printf("  defect_wd_recover     — Defect #11: wd_recover() missing protection\n");
-	printf("  defect_abort_handler  — Defect #12: Data Abort handler guard\n");
+	printf("  defect_abort_handler  — Defect #12: Data Abort handler guard (assertive, non-fatal)\n");
 	printf("  defect_boot_order     — Defect #13: Boot order issue\n");
 	printf("  defect_section_size   — Defect #15: L1 entry cache coherency\n");
 #endif
@@ -184,8 +219,9 @@ static void mmu_protect_test_usage(void)
 	printf("  al_r1_split           - TC-AL-R1: Split correctness - 256 L2 entries (safe)\n");
 	printf("  al_noaccess_restore   - TC-AL-02: No-access + restore (safe)\n");
 	printf("  al_ro_restore         - TC-AL-03: RO + restore (safe)\n");
-	printf("  al_noaccess_abort     - TC-AL-04: No-access -> Data Abort (fatal)\n");
+	printf("  al_noaccess_abort     - TC-AL-04: Section -> refused; already-4KB page -> accepted, AP=0 proven, restored (safe)\n");
 	printf("  al_split_protect      - TC-AL-05: Split + 4KB protect -> Data Abort (fatal)\n");
+	printf("  l2_pool               - TC-AL-10: L2 page-table pool accounting (safe)\n");
 #ifdef CONFIG_SMP
 	printf("  al_smp_noaccess       - TC-AL-06: SMP no-access -> Data Abort (fatal)\n");
 	printf("  al_smp_ro             - TC-AL-07: SMP RO write -> Data Abort (fatal)\n");
@@ -199,7 +235,7 @@ static void mmu_protect_test_usage(void)
 	printf("  tlb_bench             - TC-R3: TLB/split overhead benchmark (safe, ~5s)\n");
 #endif
 #ifdef CONFIG_MM_HEAP_UAF_PROTECT
-	printf("  heap_protect [1-4]    - TC-R4: allocator UAF protection (1-3 safe, 4 fatal)\n");
+	printf("  heap_protect [1-5]  - TC-R4: allocator UAF protection (1-3 safe, 4 fatal, 5 endurance <minutes>)\n");
 #endif
 #endif
 	printf("\n");
@@ -332,6 +368,7 @@ int mmu_protect_test_main(int argc, char *argv[])
 #ifdef CONFIG_WDOG_MMU_SCENARIO_TEST
 	else if (strcmp(argv[1], "defect_smp") == 0 ||
 	         strcmp(argv[1], "defect_dsb") == 0 ||
+	         strcmp(argv[1], "defect_domain_keep") == 0 ||
 	         strcmp(argv[1], "defect_dacr_clobber") == 0 ||
 	         strcmp(argv[1], "defect_heap_overlap") == 0 ||
 	         strcmp(argv[1], "defect_wd_recover") == 0 ||
@@ -345,8 +382,9 @@ int mmu_protect_test_main(int argc, char *argv[])
 			defect_cmd = TESTIOC_WDOG_DEFECT_SMP;
 		} else if (strcmp(argv[1], "defect_dsb") == 0) {
 			defect_cmd = TESTIOC_WDOG_DEFECT_DSB;
-		} else if (strcmp(argv[1], "defect_dacr_clobber") == 0) {
-			defect_cmd = TESTIOC_WDOG_DEFECT_DACR_CLOBBER;
+		} else if (strcmp(argv[1], "defect_domain_keep") == 0 ||
+			   strcmp(argv[1], "defect_dacr_clobber") == 0) {
+			defect_cmd = TESTIOC_WDOG_DEFECT_DOMAIN_KEEP;
 		} else if (strcmp(argv[1], "defect_heap_overlap") == 0) {
 			defect_cmd = TESTIOC_WDOG_DEFECT_HEAP_OVERLAP;
 		} else if (strcmp(argv[1], "defect_wd_recover") == 0) {
@@ -377,6 +415,15 @@ int mmu_protect_test_main(int argc, char *argv[])
 
 		if (ret == OK) {
 			printf("[mmu_protect_test] Defect test completed. Check debug log for results.\n");
+		} else if (errno == ENOSYS) {
+			/* A defect case the driver implements without a verdict
+			 * reports -ENOSYS, and that must not read as a defect
+			 * found.  id 33 takes this branch when
+			 * CONFIG_WDOG_MMU_PROTECT or CONFIG_MMU_PAGE_PROTECT is
+			 * off: there is no assertion left to make, only a
+			 * configuration to state. */
+
+			printf("[mmu_protect_test] Defect test NOT RUN (no assertion in driver)\n");
 		} else {
 			printf("[mmu_protect_test] ioctl returned %d (errno %d)\n", ret, errno);
 		}
@@ -449,7 +496,8 @@ int mmu_protect_test_main(int argc, char *argv[])
 	         strcmp(argv[1], "al_noaccess_restore") == 0 ||
 	         strcmp(argv[1], "al_ro_restore") == 0 ||
 	         strcmp(argv[1], "al_noaccess_abort") == 0 ||
-	         strcmp(argv[1], "al_split_protect") == 0
+	         strcmp(argv[1], "al_split_protect") == 0 ||
+	         strcmp(argv[1], "l2_pool") == 0
 #ifdef CONFIG_SMP
 	         || strcmp(argv[1], "al_smp_noaccess") == 0 ||
 	         strcmp(argv[1], "al_smp_ro") == 0 ||
@@ -472,6 +520,8 @@ int mmu_protect_test_main(int argc, char *argv[])
 			al_cmd = TESTIOC_AL_NOACCESS_ABORT;
 		} else if (strcmp(argv[1], "al_split_protect") == 0) {
 			al_cmd = TESTIOC_AL_SPLIT_PROTECT;
+		} else if (strcmp(argv[1], "l2_pool") == 0) {
+			al_cmd = TESTIOC_MMU_L2_POOL_USAGE;
 		}
 #ifdef CONFIG_SMP
 		else if (strcmp(argv[1], "al_smp_noaccess") == 0) {
@@ -567,9 +617,21 @@ int mmu_protect_test_main(int argc, char *argv[])
 			printf("  overhead                : %u %%  (gate: <10%%)\n",
 			       res.overhead_pct);
 			printf("  one runtime split       : %u us\n", res.split_cost_us);
-			printf("  protect+restore pair    : %u us (incl. SGI4 syncs)\n",
+			printf("  protect+restore pair    : %u us (4 TLB syncs)\n",
 			       res.op_cost_us);
+#ifdef CONFIG_WDOG_MMU_PROTECT
+			if (res.window_pair_us == 0) {
+				printf("  wdog write window pair  : < 1 us (below timer resolution)\n");
+			} else {
+				printf("  wdog write window pair  : %u us (1 descriptor, both cores)\n",
+				       res.window_pair_us);
+			}
+#endif
 			printf("  L2 tables used          : %u\n", res.sections_split);
+			printf("  budget after            : pool %u of %u claimed, %u held; save %u of %u pages (%u KB)\n",
+			       res.pool_claimed, res.pool_total, res.pool_held,
+			       res.saved_used, res.saved_max,
+			       (unsigned int)(res.saved_max * 4));
 			if (res.overhead_pct < 10) {
 				printf(">>> R3 PASS: 4KB heap protection is affordable <<<\n");
 			} else {
@@ -585,16 +647,29 @@ int mmu_protect_test_main(int argc, char *argv[])
 #ifdef CONFIG_MM_HEAP_UAF_PROTECT
 	else if (strcmp(argv[1], "heap_protect") == 0) {
 		int phase = 3;
+		int minutes = 1;
+		unsigned long iarg;
 
 		if (argc > 2) {
 			phase = argv[2][0] - '0';
 		}
-		if (phase < 1 || phase > 4) {
-			printf("[mmu_protect_test] heap_protect phase must be 1..4\n");
+		if (phase == 5 && argc > 3) {
+			minutes = atoi(argv[3]);
+			if (minutes < 1) {
+				minutes = 1;
+			}
+		}
+		if (phase < 1 || phase > 5) {
+			printf("[mmu_protect_test] heap_protect phase must be 1..5 (5: endurance, 4th arg = minutes)\n");
 			return ERROR;
 		}
 
-		printf("=== Heap UAF protection stress (R4), phase %d ===\n", phase);
+		if (phase == 5) {
+			printf("=== Heap UAF protection stress (R4), endurance %d minute(s) ===\n",
+			       minutes);
+		} else {
+			printf("=== Heap UAF protection stress (R4), phase %d ===\n", phase);
+		}
 		if (phase == 4) {
 			printf("[mmu_protect_test] FATAL: step 4 writes to freed+protected memory\n");
 			printf("[mmu_protect_test] -> expect Data Abort + FAULT REPORT + PANIC.\n");
@@ -607,7 +682,9 @@ int mmu_protect_test_main(int argc, char *argv[])
 			return ERROR;
 		}
 
-		ret = ioctl(fd, TESTIOC_MMU_HEAP_PROTECT_STRESS, (unsigned long)phase);
+		iarg = (unsigned long)((phase == 5) ?
+			(phase | (minutes << 8)) : phase);
+		ret = ioctl(fd, TESTIOC_MMU_HEAP_PROTECT_STRESS, iarg);
 
 		if (ret == OK) {
 			printf("[mmu_protect_test] phase %d completed (details in debug log)\n",
@@ -624,6 +701,75 @@ int mmu_protect_test_main(int argc, char *argv[])
 	}
 #endif /* CONFIG_MM_HEAP_UAF_PROTECT */
 #endif /* CONFIG_MMU_PAGE_PROTECT */
+#ifdef CONFIG_WDOG_MMU_PROTECT
+	/* Write-window state (id 58) and the live descriptor of the protected page
+	 * (id 59).  Both are read-only - no fault, no write, safe at any time.
+	 * They exist so the SMP rules (owner, depth, failure counters) can be read
+	 * from the shell instead of only from a rebuild with extra prints.
+	 */
+	else if (strcmp(argv[1], "wdog_state") == 0 ||
+		 strcmp(argv[1], "wdog_page") == 0) {
+		int cmd = (strcmp(argv[1], "wdog_state") == 0)
+			? TESTIOC_WDOG_MMU_WINDOW_STATE : TESTIOC_WDOG_MMU_PAGE_REPORT;
+
+		fd = open(OS_API_TEST_DRVPATH, O_RDWR);
+		if (fd < 0) {
+			printf("[mmu_protect_test] FAIL: cannot open %s (errno %d)\n",
+			       OS_API_TEST_DRVPATH, errno);
+			return ERROR;
+		}
+
+		ret = ioctl(fd, cmd, 0);
+		printf("[mmu_protect_test] %s -> %d (errno %d), details in debug log\n",
+		       argv[1], ret, errno);
+
+		close(fd);
+		return ret;
+
+	/* Verdict commands: the driver decides and the ioctl carries the verdict.
+	 * wdog_refuse (id 60) has to see -EINVAL for an address that is still a
+	 * section; wdog_pair (id 61) has to leave both failure counters where
+	 * they were, so a non-OK return here is a real defect, not a crash.
+	 */
+	} else if (strcmp(argv[1], "wdog_refuse") == 0 ||
+		   strcmp(argv[1], "wdog_pair") == 0) {
+		int cmd = TESTIOC_WDOG_MMU_REFUSE_SECTION;
+		unsigned long arg = 0;
+
+		if (strcmp(argv[1], "wdog_pair") == 0) {
+			unsigned long n = 32;
+
+			cmd = TESTIOC_WDOG_MMU_WINDOW_PAIR;
+
+			if (argc > 2 && sscanf(argv[2], "%lu", &n) != 1) {
+				printf("[mmu_protect_test] wdog_pair: bad count '%s'\n",
+				       argv[2]);
+				return ERROR;
+			}
+
+			if (n < 1 || n > 1000) {
+				printf("[mmu_protect_test] wdog_pair count must be 1..1000\n");
+				return ERROR;
+			}
+
+			arg = n;
+		}
+
+		fd = open(OS_API_TEST_DRVPATH, O_RDWR);
+		if (fd < 0) {
+			printf("[mmu_protect_test] FAIL: cannot open %s (errno %d)\n",
+			       OS_API_TEST_DRVPATH, errno);
+			return ERROR;
+		}
+
+		ret = ioctl(fd, cmd, arg);
+		printf("[mmu_protect_test] %s -> %d : %s\n", argv[1], ret,
+		       (ret == OK) ? "PASS" : "FAIL (see debug log)");
+
+		close(fd);
+		return ret;
+	}
+#endif /* CONFIG_WDOG_MMU_PROTECT */
 	else {
 
 		mmu_protect_test_usage();

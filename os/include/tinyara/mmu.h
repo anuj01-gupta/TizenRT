@@ -80,7 +80,7 @@ void mmu_clear_app_pgtbl(uint32_t app_id);
  *
  ****************************************************************************/
 
-void mmu_split_section_to_l2(uint32_t vaddr);
+int mmu_split_section_to_l2(uint32_t vaddr);
 
 /****************************************************************************
  * Name: mmu_save_page_pte
@@ -110,7 +110,7 @@ uint32_t mmu_save_page_pte(uint32_t vaddr);
  *
  ****************************************************************************/
 
-void mmu_set_page_no_access(uint32_t vaddr);
+int mmu_set_page_no_access(uint32_t vaddr);
 
 /****************************************************************************
  * Name: mmu_set_page_ro
@@ -125,7 +125,7 @@ void mmu_set_page_no_access(uint32_t vaddr);
  *
  ****************************************************************************/
 
-void mmu_set_page_ro(uint32_t vaddr);
+int mmu_set_page_ro(uint32_t vaddr);
 
 /****************************************************************************
  * Name: mmu_restore_page_pte
@@ -140,8 +140,73 @@ void mmu_set_page_ro(uint32_t vaddr);
  *
  ****************************************************************************/
 
-void mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte);
+int mmu_restore_page_pte(uint32_t vaddr, uint32_t saved_pte);
 
+/* Split the section that contains vaddr and keep the resulting second-level
+ * table for the caller: the table is never released and is tagged with
+ * 'owner' so a later mmu_split_section_to_l2() on the same 1MB region is
+ * accepted instead of refused.  Returns OK, -EINVAL (not a section) or
+ * -ENOMEM (L2 pool exhausted). */
+
+int mmu_protect_page_reserve(uint32_t vaddr, const char *owner);
+
+/* Read the live small-page descriptor for vaddr: *pte receives the raw
+ * descriptor and *ap the access permission folded to
+ * AP[1:0] | (AP2 << 1), so 0..3 - 0 = no access, 1 = privileged
+ * read/write, 3 = privileged read-only ("is it protected?" is a test of
+ * bit 1).  Returns -EINVAL when the address is not covered by a page
+ * table, i.e. it is still a 1MB section and has no 4KB permission at all. */
+
+int mmu_get_page_pte_raw(uint32_t vaddr, uint32_t *pte, uint8_t *ap);
+
+/* Claimed second-level tables of the static L2 pool: returns the number in
+ * use and, through 'total', the number CONFIG_MMU_L2_POOL_TABLES allows.
+ * Tables are never released, so the returned count only grows. */
+
+uint32_t mmu_l2_pool_usage(uint32_t *total);
+
+/* Of the claimed tables, how many are tagged as held for a region that is
+ * protected for the life of the system (mmu_protect_page_reserve()).  The
+ * difference against mmu_l2_pool_usage() is what ad-hoc splitting has used;
+ * tables are never released, so neither number goes down. */
+
+uint32_t mmu_l2_pool_held(void);
+
+/* Cumulative split / protection counters for soak runs and post-mortem
+ * inspection: ok counts the pages currently protected, skipped the map
+ * attempts that found a mapping they do not own, and failed_budget the
+ * attempts refused because the L2 pool was exhausted. */
+
+#ifdef CONFIG_MMU_PAGE_PROTECT
+void mmu_protect_get_counters(uint32_t *ok, uint32_t *skipped,
+                              uint32_t *failed_budget);
+#else
+#define mmu_protect_get_counters(a, b, c)    do { } while (0)
+#endif
+
+/* Largest range mmu_protect_range_no_access() accepts, and how many pages the
+ * save table currently holds.  The allocator hook asks for the first instead
+ * of keeping its own copy of the limit (two definitions of one number drift
+ * apart with nothing but a coverage counter to show for it); the second is
+ * the ceiling on how much memory can be No-Access at once - the L2 pool only
+ * bounds how many 1MB sections can ever be split. */
+
+size_t mmu_protect_range_max(void);
+uint32_t mmu_protect_saved_usage(uint32_t *max);
+
+/* Is the page containing vaddr currently an AP=0 descriptor?  Read only, no
+ * side effect.  Any dump path that walks freed heap memory must ask this
+ * before dereferencing (plan risk R5: the reporter must not fault inside the
+ * fault it reports). */
+
+bool mmu_range_is_no_access(uintptr_t vaddr);
+
+/* Hardening: non-zero once a MANAGER-domain mapping has been observed.
+ * AP-bit protection is vacuous while this holds, so a subsystem must
+ * refuse to install it (the watchdog init does).  Implemented over the
+ * live DACR as well as the latched flag. */
+
+bool mmu_domain_manager_seen(void);
 #endif /* CONFIG_MMU_PAGE_PROTECT */
 
 /****************************************************************************

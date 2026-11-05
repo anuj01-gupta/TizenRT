@@ -131,6 +131,39 @@ config MMU_PAGE_PROTECT
 
 		Currently untested — enable only for development.
 
+config MMU_L2_POOL_TABLES
+	int "Number of second-level page tables reserved for page protection"
+	default 24
+	depends on MMU_PAGE_PROTECT
+	---help---
+		Protecting a region that is mapped by a 1MB section first has to
+		map it through the second level, which costs one 1KB page table
+		per 1MB section covered.  This is how many such tables exist.
+
+		It bounds how much address space can ever be page-protected
+		(24 tables = 24MB); when the pool is exhausted the protection
+		call returns -ENOMEM and the region is left untouched - the
+		allocator never silently widens a protection to a whole
+		section to make do.
+
+config MMU_TLB_SYNC_HW_BROADCAST
+	bool "Synchronise page-table changes with hardware TLB broadcast"
+	default n
+	depends on MMU_PAGE_PROTECT && SMP
+	---help---
+		After changing the permissions of a page, the address has to be
+		invalidated in the TLB of every core that shares the page
+		table.
+
+		Y: issue the inner-shareable TLBI (TLBIMVAAIS) and continue.
+		No interrupt, no waiting; requires the cluster to actually
+		broadcast TLBI operations.
+
+		N: send an IPI (SGI4) to each other core and wait for it to
+		acknowledge the flush.  Guaranteed to work on any GIC, but it
+		is not re-entrant and the handler flushes that core's entire
+		TLB, not just the changed entry.
+
 config MMU_FAULT_REPORT
 	bool "MMU data abort fault report (decode DFSR + region lookup)"
 	default y
@@ -138,9 +171,11 @@ config MMU_FAULT_REPORT
 	---help---
 		Enable the MMU data abort fault report. On every data abort the
 		abort handler decodes the fault status (fault class, read/write
-		direction, domain), prints the faulting task (pid and name), and
-		looks up the protected region registry to name the region that
-		was hit (R2 mitigation, design items M0-5 / M0-6).
+		direction, domain), prints the faulting task (pid and name),
+		the access permission the faulting page really has, the state
+		of the watchdog write window, and looks up the protected region
+		registry to name the region that was hit (R2 mitigation, design
+		items M0-5 / M0-6).
 
 		Abort-context safe: no allocation, no locks, fixed-size table
 		scan, TCB reads guarded against nested faults (Gate 1 criterion:
